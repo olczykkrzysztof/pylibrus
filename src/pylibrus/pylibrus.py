@@ -881,7 +881,7 @@ class LibrusNotifier:
 
     @staticmethod
     def format_sender(sender_info, sender_email):
-        sender_b64 = base64.b64encode(sender_info.encode())
+        sender_b64 = base64.b64encode(f"{sender_info} @ Librus".encode())
         sender_info_encoded = "=?utf-8?B?" + sender_b64.decode() + "?="
         return f'"{sender_info_encoded}" <{sender_email}>'
 
@@ -889,7 +889,7 @@ class LibrusNotifier:
         msg = MIMEMultipart("alternative")
         msg.set_charset("utf-8")
 
-        msg["Subject"] = msg_from_db.subject
+        msg["Subject"] = f"[LIBRUS] {msg_from_db.subject}"
         msg["From"] = self.format_sender(msg_from_db.sender, self._librus_user.notify.smtp_user)
         msg["To"] = ", ".join(self._librus_user.notify.email_dest)
 
@@ -921,8 +921,25 @@ class LibrusNotifier:
             + "</ul>"
         )
 
-        html_part = MIMEText(msg_from_db.contents_html + attachments_as_html_msg, "html")
-        text_part = MIMEText(msg_from_db.contents_text + attachments_as_text_msg, "plain")
+        header_as_text_msg = f"""
+
+-------------------
+
+!! TO WIADOMOŚĆ Z LIBRUSA, NIE ODPOWIADAJ NA NIĄ MEJLEM !!!
+Data wysłania: {msg_from_db.date}
+
+-------------------
+
+"""
+
+        header_as_html_msg = f"""<br/><h3>!!! To wiadomość z Librusa, nie odpowiadaj na nią mejlem!!!</h3>
+<br><br>
+<b> Data wysłania:</b> {msg_from_db.date} <br>
+<hr>
+<br><br>"""
+
+        html_part = MIMEText(msg_from_db.contents_html + header_as_html_msg + attachments_as_html_msg, "html")
+        text_part = MIMEText(msg_from_db.contents_text + header_as_text_msg + attachments_as_text_msg, "plain")
         msg.attach(html_part)
         msg.attach(text_part)
         for attach in attachments_with_data:
