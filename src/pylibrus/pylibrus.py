@@ -889,7 +889,7 @@ class LibrusNotifier:
         msg = MIMEMultipart("alternative")
         msg.set_charset("utf-8")
 
-        msg["Subject"] = f"[LIBRUS] {msg_from_db.subject}"
+        msg["Subject"] = f"[LIBRUS {self._librus_user.name}] {msg_from_db.subject}"
         msg["From"] = self.format_sender(msg_from_db.sender, self._librus_user.notify.smtp_user)
         msg["To"] = ", ".join(self._librus_user.notify.email_dest)
 
