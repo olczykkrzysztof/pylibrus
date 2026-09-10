@@ -19,6 +19,18 @@
 ; Value 4 means that only messages younger than 4 days will be forwarded.
 # max_age_of_sending_msg_days=4
 
+; If Librus announcements ("ogloszenia") should be forwarded too, in addition to messages.
+; Possible values: true, false
+; Can be configured globally or per child (see fetch_announcements under [user:ChildName] below)
+# fetch_announcements=true
+
+; How old announcements should still be forwarded.
+; Falls back to max_age_of_sending_msg_days if not set.
+; NOTE: announcements have no per-item read/unread flag in Librus, so unlike messages
+; they always behave as if send_message=unsent - they are forwarded once (based on this
+; age window) and never re-sent, regardless of the send_message setting above.
+# max_age_of_sending_announcement_days=4
+
 ; Should debug messages be enabled.
 ; Possible values: true, false
 # debug=false
@@ -33,6 +45,8 @@ librus_user=
 librus_pass=
 ; optional, if not set global db_name is used
 ;db_name=
+; optional, overrides the global fetch_announcements setting for this child only
+;fetch_announcements=true
 smtp_user=
 smtp_pass=
 smtp_server=
