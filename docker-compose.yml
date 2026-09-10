@@ -1,0 +1,20 @@
+services:
+  pylibrus:
+    build: .
+    # image: ghcr.io/<you>/pylibrus:latest
+    restart: unless-stopped
+    environment:
+      CRON_SCHEDULE: "*/5 * * * *"
+      # Uncomment for single-user env-var mode instead of mounting pylibrus.ini below.
+      # LIBRUS_USER: ""
+      # LIBRUS_PASS: ""
+      # LIBRUS_NAME: ""
+    volumes:
+      # Optional: multi-user pylibrus.ini (see pylibrus.ini.example). Read-only is fine,
+      # pylibrus never writes to it.
+      - ./pylibrus.ini:/config/pylibrus.ini:ro
+      # Required for persistence: cookies + per-user SQLite DB(s) survive restarts here.
+      - pylibrus-data:/data
+
+volumes:
+  pylibrus-data:

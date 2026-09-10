@@ -11,6 +11,41 @@ message from a given folder to an e-mail, and (optionally) new announcements too
 * Setup `pylibrus.ini` according to [`pylibrus.ini.example`](pylibrus.ini.example)
 * Run from cron every few minutes
 
+## Running in Docker
+
+The image runs [`supercronic`](https://github.com/aptible/supercronic) in the foreground as
+its own cron daemon, so the container just idles between ticks (no separate scheduler process
+to babysit) and job output goes straight to `docker logs`.
+
+```bash
+docker build -t pylibrus .
+
+docker run -d --name pylibrus \
+  -e CRON_SCHEDULE="*/5 * * * *" \
+  -v "$(pwd)/pylibrus.ini:/config/pylibrus.ini:ro" \
+  -v pylibrus-data:/data \
+  pylibrus
+```
+
+Or with `docker-compose.yml` (included in the repo): `docker compose up -d`.
+
+Configuration knobs, all via environment variables:
+
+- `CRON_SCHEDULE` - standard 5-field crontab expression, default `*/5 * * * *` (matches the
+  `Procfile`).
+- `CONFIG_FILE` - where pylibrus looks for `pylibrus.ini`, default `/config/pylibrus.ini`. Mount
+  your `pylibrus.ini` there (see [`pylibrus.ini.example`](pylibrus.ini.example) for multi-user
+  setups); it's only ever read, so a read-only mount is fine.
+- `DATA_DIR` - working directory for state, default `/data`. This is where cookies
+  (`pylibrus_cookies.json`) and each user's SQLite DB get written between runs - mount a volume
+  here or that state is lost whenever the container is recreated.
+- If nothing is mounted at `CONFIG_FILE`, pylibrus automatically falls back to single-user
+  env-var configuration (`LIBRUS_USER`, `LIBRUS_PASS`, `LIBRUS_NAME`, etc. - see
+  `read_pylibrus_config()` and the `from_env()` classmethods in `pylibrus.py` for the full list).
+  Just pass those as container env vars instead of mounting a config file; a `DATA_DIR` volume
+  is still recommended so cookies/DB persist.
+- `PYLIBRUS_EXTRA_ARGS` - extra CLI flags appended to each run, e.g. `--debug`.
+
 ## Webhook attachments in S3
 
 Webhook notifications can send attachment links from Librus or from S3.
