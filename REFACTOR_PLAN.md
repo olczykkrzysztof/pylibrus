@@ -28,8 +28,11 @@ Found while reading, all three are the kind a unit test would have caught immedi
 
 - `pylibrus.py:741` — `get_attach_resp` is never initialised before the branch chain at
   `pylibrus.py:721-739`. If an attachment page has no `singleUseKey` and no `onload` redirect,
-  `if get_attach_resp is not None` raises `NameError`. Worse, on the *second* attachment of a
-  message the name is still bound from the previous iteration, so a stale response is read.
+  `if get_attach_resp is not None` raises `UnboundLocalError`. On a later attachment of the same
+  message the name is instead still bound from the previous iteration, so a stale response is
+  read — harmless as it happens, because every branch that leaves the name stale also sets
+  `reason`, which overwrites the data further down, but it is one edit away from serving one
+  attachment's bytes under another's name.
 - `pylibrus.py:496` — `if not self._cookie_path.exists:` is missing the call parens. A bound
   method is always truthy, so the "does not exist" debug line can never fire.
 - `pylibrus.py:864` — same missing parens on `workdir_path.exists`, so the

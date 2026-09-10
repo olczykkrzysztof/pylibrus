@@ -493,8 +493,9 @@ class LibrusScraper:
         self.load_cookies_from_file()
 
     def load_cookies_per_login(self):
-        if not self._cookie_path.exists:
+        if not self._cookie_path.exists():
             logger.debug(f"{self._cookie_path} does not exist")
+            return {}
         try:
             return json.loads(self._cookie_path.read_text())
         except Exception as e:
@@ -712,6 +713,9 @@ class LibrusScraper:
 
             attach_data = None
             reason = ""
+            # Must be reset per attachment: not every branch below assigns it, and a value
+            # left over from the previous iteration would be read as this attachment's data.
+            get_attach_resp = None
             download_key = retrieve_from(attachment_page.text, 'singleUseKey = "', '"')
             if download_key:
                 referer = attachment_page.url
@@ -861,7 +865,7 @@ class LibrusNotifier:
 
     def _create_db(self):
         workdir_path = Path(self._pylibrus_config.workdir)
-        if not workdir_path.exists:
+        if not workdir_path.exists():
             raise RuntimeError(f"Workdir {workdir_path} does not exist")
         self._engine = create_engine(f"sqlite:///{workdir_path / self._librus_user.db_name}")
         Base.metadata.create_all(self._engine)
