@@ -987,7 +987,7 @@ def send_test_notification(pylibrus_config: PyLibrusConfig, librus_user: LibrusU
     return 2
 
 
-def handle_user(pylibrus_config: PyLibrusConfig, librus_user: LibrusUser):
+def handle_user(pylibrus_config: PyLibrusConfig, librus_user: LibrusUser, dry_run: bool = False):
     with LibrusScraper(librus_user.login, librus_user.password, pylibrus_config=pylibrus_config) as scraper:
         with LibrusNotifier(pylibrus_config, librus_user) as notifier:
             msgs = scraper.msgs_from_folder(pylibrus_config.inbox_folder_id)
@@ -1019,6 +1019,13 @@ def handle_user(pylibrus_config: PyLibrusConfig, librus_user: LibrusUser):
                         attachments,
                     )
 
+                if dry_run:
+                    # Do not notify and do not touch msg.email_sent, so a regular (non-dry) run
+                    # afterwards still sends this message normally.
+                    already_sent = "yes" if msg.email_sent else "no"
+                    logger.info(f"[DRY RUN] '{msg.subject}' (already sent: {already_sent})")
+                    continue
+
                 if pylibrus_config.send_message == "unsent" and msg.email_sent:
                     logger.info(f"Do not send '{msg.subject}' (message already sent)")
                 elif pylibrus_config.send_message == "unread" and read:
@@ -1048,6 +1055,18 @@ def parse_args():
     tests = parser.add_argument_group("Test notifications")
     tests.add_argument("--test-notify", action="store_true", default=False, help="send a test notification")
 
+    dry_run = parser.add_argument_group("Dry run")
+    dry_run.add_argument(
+        "--dry",
+        action="store_true",
+        default=False,
+        help=(
+            "go through all messages without sending them by email or webhook; "
+            "just print each message's title and whether it was already sent "
+            "(does not touch the email_sent flag, so a regular run afterwards still sends it)"
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -1065,7 +1084,7 @@ def main():
         return send_test_notification(pylibrus_config, librus_users[0])
 
     for i, librus_user in enumerate(librus_users):
-        handle_user(pylibrus_config, librus_user)
+        handle_user(pylibrus_config, librus_user, dry_run=args.dry)
         if i != len(librus_users) - 1:
             time.sleep(pylibrus_config.sleep_between_librus_users)
 
