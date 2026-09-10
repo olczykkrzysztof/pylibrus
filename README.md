@@ -1,7 +1,7 @@
 # pyLibrus
 
 Message scraper from crappy Librus Synergia gradebook. Forwards every new
-message from a given folder to an e-mail.
+message from a given folder to an e-mail, and (optionally) new announcements too.
 
 ## Running
 
@@ -37,8 +37,29 @@ Recommended setting is to automatically remove files after 7 days.
 
 One bucket can be used for many users at the same time.
 
+## Announcements
+
+pyLibrus can also forward Librus announcements ("ogłoszenia") - school-wide or
+class-wide notices, separate from the inbox. Enabled by default
+(`fetch_announcements=true`), can be turned off globally or per child; see
+[`pylibrus.ini.example`](pylibrus.ini.example).
+
+Announcements are sent through the same e-mail/webhook path as messages, with a
+distinct subject prefix ("Ogłoszenie: ...") and banner. A few things are inherently
+different from messages, because Librus exposes announcements differently:
+
+* Announcements have no attachments and no per-item read/unread flag, so
+  `send_message=unread` does not apply to them - each announcement is forwarded once
+  and never re-sent, regardless of that setting.
+* Announcements have no stable id in Librus; pyLibrus derives one from
+  title+author+publication date, so editing an announcement's body afterwards does not
+  trigger a re-send.
+* Only announcements published within `max_age_of_sending_announcement_days` are
+  forwarded (defaults to `max_age_of_sending_msg_days`).
+
+See [`ANNOUNCEMENTS_PLAN.md`](ANNOUNCEMENTS_PLAN.md) for the full design rationale.
+
 ## Potential improvements
 
 * support HTML messages
-* support announcements
 * support calendar

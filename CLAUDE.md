@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-pyLibrus scrapes new messages from the Librus Synergia parent gradebook portal and forwards
-them by email or webhook (with optional S3-hosted attachment links). It's meant to run
-unattended from cron (see `Procfile`: `*/5 * * * *`).
+pyLibrus scrapes new messages (and, optionally, announcements) from the Librus Synergia parent
+gradebook portal and forwards them by email or webhook (with optional S3-hosted attachment
+links). It's meant to run unattended from cron (see `Procfile`: `*/5 * * * *`).
 
-The entire application is one file: `src/pylibrus/pylibrus.py` (~1050 lines). There are no
+The entire application is one file: `src/pylibrus/pylibrus.py` (~1200 lines). There are no
 other modules and no test suite.
 
 ## Commands
@@ -54,12 +54,36 @@ managers:
   Session cookies are cached to a JSON file (`pylibrus_cookies.json` by default) and reused
   across runs to avoid re-login on every cron tick; `are_cookies_valid()` checks first.
 - **`LibrusNotifier`** — owns a SQLAlchemy/SQLite session (one DB file per user, `db_name` in
-  config) recording every seen `Msg`/`Attachment` so messages are never processed twice, then
-  sends new ones out via email (`smtplib`) or webhook (`requests.post`, Slack-style `{"text":
-  ...}` payload).
+  config) recording every seen `Msg`/`Attachment`/`LibrusAnnouncement` so items are never
+  processed twice, then sends new ones out via email (`smtplib`) or webhook (`requests.post`,
+  Slack-style `{"text": ...}` payload).
 
 `handle_user()` decides per-message whether to notify based on `send_message` config
 (`"unread"` vs `"unsent"`) and `max_age_of_sending_msg_days`, then marks `msg.email_sent`.
+
+### Announcements
+
+Librus announcements ("ogłoszenia") are a separate feature from messages, scraped from
+`/ogloszenia` by `LibrusScraper.fetch_announcements()` and handled by the sibling
+`handle_announcements()` (called from `handle_user()`, wrapped in a broad `try/except` so a
+markup change here never blocks message forwarding). Unlike messages, Librus gives
+announcements no stable id, no per-item URL and no per-item read/unread flag — see
+`ANNOUNCEMENTS_PLAN.md` for the full design rationale. Consequences that matter when touching
+this code:
+- `LibrusAnnouncement` (stored in the `announcements` table) uses a synthetic primary key from
+  `announcement_id(title, author, date)` — a sha1 of `title|author|date`, deliberately excluding
+  the body so an announcement edited in place isn't re-sent as new.
+- `send_message` (`"unread"`/`"unsent"`) does not apply to announcements — they always dedupe
+  the "unsent" way via `email_sent`, gated only by `max_age_of_sending_announcement_days`
+  (`PyLibrusConfig`, falls back to `max_age_of_sending_msg_days`).
+- `LibrusAnnouncement` deliberately reuses `Msg`'s attribute names (`url`, `sender`, `subject`,
+  `date`, `contents_html`, `contents_text`, `email_sent`) so `LibrusNotifier.notify()`,
+  `send_email()` and `send_via_webhook()` work on both unchanged; the only per-type
+  customization is the `subject_prefix`/`banner_text`/`banner_html`/`webhook_item_label` class
+  attributes each model defines.
+- `fetch_announcements` is toggled globally (`PyLibrusConfig`) and per-user (`LibrusUser`,
+  `None` meaning "fall back to global") — keep both `from_config()`/`from_env()` in sync as
+  usual.
 
 ### Attachments
 
@@ -78,7 +102,10 @@ bytes need to be downloaded at all — keep it in sync when adding a new attachm
 
 ### Database
 
-`Msg`/`Attachment` are SQLAlchemy declarative models (`Base`, shared across all user DBs but one
-SQLite file per user). Schema changes must be added to `LibrusNotifier._migrate_attachment_table()`
-(a hand-rolled additive migration run at startup) since there's no Alembic — new nullable columns
-on `Attachment`/`Msg` need an explicit `ALTER TABLE` there or existing users' DBs won't pick them up.
+`Msg`/`Attachment`/`LibrusAnnouncement` are SQLAlchemy declarative models (`Base`, shared across
+all user DBs but one SQLite file per user). New tables need nothing beyond `Base.metadata.create_all()`
+(run automatically in `_create_db()`), but schema changes on *existing* tables must be added to
+`LibrusNotifier._migrate_tables()` (a hand-rolled additive migration run at startup, renamed
+from `_migrate_attachment_table()` when announcements were added) since there's no Alembic — new
+nullable columns on `Attachment`/`Msg`/`LibrusAnnouncement` need an explicit `ALTER TABLE` there
+or existing users' DBs won't pick them up.

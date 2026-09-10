@@ -19,7 +19,11 @@ dependencies = [
 [tool.uv]
 dev-dependencies = [
     "ruff>=0.8.4",
+    "pytest>=8.3.0",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 120
@@ -79,4 +83,9 @@ ignore = [
     "Q003", # avoidable-escaped-quote
     "S101", # Use of `assert` detected
     "W191", # tab-indentation
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "S106", # hardcoded-password-func-arg - fake credentials in test fixtures
 ]

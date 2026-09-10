@@ -67,9 +67,12 @@ class PyLibrusConfig:
     send_message: str = "unread"
     fetch_attachments: bool = True
     max_age_of_sending_msg_days: int = 4
+    fetch_announcements: bool = True
+    max_age_of_sending_announcement_days: int | None = None
     debug: bool = False
     sleep_between_librus_users: int = 10
     inbox_folder_id: int = dataclasses.field(default=5, init=False)  # Odebrane
+    announcements_path: str = dataclasses.field(default="/ogloszenia", init=False)
     cookie_file: str = "pylibrus_cookies.json"
 
     def __post_init__(self):
@@ -78,6 +81,8 @@ class PyLibrusConfig:
                 setattr(self, field.name, field.default)
         if self.send_message not in ("unread", "unsent"):
             raise ValueError("SEND_MESSAGE should be 'unread' or 'unsent'")
+        if self.max_age_of_sending_announcement_days is None:
+            self.max_age_of_sending_announcement_days = self.max_age_of_sending_msg_days
 
     @classmethod
     def from_config(cls, workdir: str, config: ConfigParser) -> "PyLibrusConfig":
@@ -86,6 +91,10 @@ class PyLibrusConfig:
             send_message=global_config.get(PyLibrusConfig.send_message.__name__, None),
             fetch_attachments=global_config.getboolean(PyLibrusConfig.fetch_attachments.__name__, None),
             max_age_of_sending_msg_days=global_config.getint(PyLibrusConfig.max_age_of_sending_msg_days.__name__, None),
+            fetch_announcements=global_config.getboolean(PyLibrusConfig.fetch_announcements.__name__, None),
+            max_age_of_sending_announcement_days=global_config.getint(
+                PyLibrusConfig.max_age_of_sending_announcement_days.__name__, None,
+            ),
             debug=global_config.getboolean(PyLibrusConfig.debug.__name__, None),
             sleep_between_librus_users=global_config.getint(PyLibrusConfig.sleep_between_librus_users.__name__, None),
             cookie_file=global_config.get(PyLibrusConfig.cookie_file.__name__, None),
@@ -98,6 +107,8 @@ class PyLibrusConfig:
             send_message=os.environ.get("SEND_MESSAGE"),
             fetch_attachments=str_to_bool(os.environ.get("FETCH_ATTACHMENTS")),
             max_age_of_sending_msg_days=str_to_int(os.environ.get("MAX_AGE_OF_SENDING_MSG_DAYS")),
+            fetch_announcements=str_to_bool(os.environ.get("FETCH_ANNOUNCEMENTS")),
+            max_age_of_sending_announcement_days=str_to_int(os.environ.get("MAX_AGE_OF_SENDING_ANNOUNCEMENT_DAYS")),
             debug=str_to_bool(os.environ.get("LIBRUS_DEBUG")),
             workdir=workdir,
         )
@@ -225,6 +236,7 @@ class LibrusUser:
     name: str
     notify: EmailNotify | WebhookNotify
     db_name: str
+    fetch_announcements: bool | None = None  # None means: fall back to the global setting
 
     @classmethod
     def from_config(cls, config, section) -> "LibrusUser":
@@ -241,7 +253,15 @@ class LibrusUser:
         db_name = config[section].get("db_name")
         if not db_name:
             db_name = config["global"].get("db_name", "pylibrus.sqlite")
-        return cls(name=name, login=librus_user, password=librus_pass, notify=notify, db_name=db_name)
+        fetch_announcements = config[section].getboolean("fetch_announcements", fallback=None)
+        return cls(
+            name=name,
+            login=librus_user,
+            password=librus_pass,
+            notify=notify,
+            db_name=db_name,
+            fetch_announcements=fetch_announcements,
+        )
 
     @classmethod
     def from_env(cls) -> "LibrusUser":
@@ -251,6 +271,7 @@ class LibrusUser:
             name=os.environ.get("LIBRUS_NAME"),
             notify=WebhookNotify.from_env() if str_to_bool(os.environ.get("WEBHOOK")) else EmailNotify.from_env(),
             db_name=os.environ.get("DB_NAME"),
+            fetch_announcements=str_to_bool(os.environ.get("FETCH_ANNOUNCEMENTS")),
         )
 
     @classmethod
@@ -275,6 +296,12 @@ class Msg(Base):
     contents_text = Column(String)
     email_sent = Column(Boolean, default=False)
 
+    # No subject prefix/banner override for regular messages; see LibrusAnnouncement.
+    subject_prefix = ""
+    banner_text = "TO WIADOMOŚĆ Z LIBRUSA, NIE ODPOWIADAJ NA NIĄ MEJLEM"
+    banner_html = "To wiadomość z Librusa, nie odpowiadaj na nią mejlem"
+    webhook_item_label = "Temat"
+
 
 class Attachment(Base):
     __tablename__ = "attachments"
@@ -286,6 +313,42 @@ class Attachment(Base):
     s3_key = Column(String, nullable=True)
     s3_upload_date = Column(DateTime, nullable=True)
     s3_etag = Column(String, nullable=True)
+
+
+class LibrusAnnouncement(Base):
+    """A Librus announcement (AKA 'ogłoszenie'), scraped from /ogloszenia.
+
+    Announcements have no stable id and no per-item read/unread flag (see
+    ANNOUNCEMENTS_PLAN.md), so `url` is a synthetic key derived from title+author+date
+    (see `announcement_id()`) rather than a real Librus URL, and `email_sent` is the
+    only dedupe signal - `send_message=unread` semantics do not apply here.
+
+    Column names deliberately match `Msg` so `LibrusNotifier.notify()` and friends can
+    treat both the same way; `contents_html`/`contents_text` hold the announcement body.
+    """
+
+    __tablename__ = "announcements"
+
+    url = Column(String, primary_key=True)  # synthetic, see announcement_id()
+    sender = Column(String)  # "Dodał"
+    subject = Column(String)  # title
+    date = Column(DateTime)  # "Data publikacji" (date only, no time)
+    contents_html = Column(String)
+    contents_text = Column(String)
+    content_hash = Column(String, nullable=True)  # sha1 of contents_text; unused today, for future edit-detection
+    email_sent = Column(Boolean, default=False)
+
+    subject_prefix = "Ogłoszenie: "
+    banner_text = "TO OGŁOSZENIE Z LIBRUSA, NIE ODPOWIADAJ NA NIE MEJLEM"
+    banner_html = "To ogłoszenie z Librusa, nie odpowiadaj na nie mejlem"
+    webhook_item_label = "Ogłoszenie"
+
+
+def announcement_id(title: str, author: str, date: datetime.datetime) -> str:
+    # Deliberately excludes the body: an announcement edited in place (title/author/date
+    # unchanged) keeps the same id, so it is not re-sent as "new". See ANNOUNCEMENTS_PLAN.md.
+    digest = hashlib.sha1(f"{title}|{author}|{date:%Y-%m-%d}".encode()).hexdigest()[:16]
+    return f"/ogloszenia#{digest}"
 
 
 def retrieve_from(txt, start, end):
@@ -728,6 +791,66 @@ class LibrusScraper:
         msgs.reverse()
         return msgs
 
+    def fetch_announcements(self) -> list[tuple[str, str, datetime.datetime, str, str]]:
+        """Scrapes /ogloszenia and returns (title, author, date, contents_html, contents_text) tuples.
+
+        Announcements have no pagination, no per-item URL and no read/unread flag - the
+        whole page lists every currently valid announcement on every call, newest first
+        as Librus renders it. The caller is responsible for deduplication (there is no
+        stable id to key on - see `announcement_id()`). See ANNOUNCEMENTS_PLAN.md for the
+        full rationale, including why unknown/missing fields are logged and skipped
+        rather than raising: a cosmetic Librus markup change here must not break message
+        forwarding, which is the primary feature.
+        """
+        resp = self._get(
+            self._pylibrus_config.announcements_path,
+            referer=self.synergia_url_from_path("/rodzic/index"),
+        )
+        if "Brak dostępu" in resp.text:
+            raise RuntimeError("Brak dostępu when fetching announcements - cookies likely invalid")
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        announcements = []
+        for table in soup.find_all("table", class_="decorated"):
+            thead = table.find("thead")
+            if thead is None:
+                continue
+            title = thead.get_text().strip()
+
+            fields = {}
+            for row in table.find_all("tr"):
+                th = row.find("th")
+                td = row.find("td")
+                if th is None or td is None:
+                    continue
+                fields[th.get_text().strip()] = td
+
+            date_td = fields.get("Data publikacji")
+            if not title or date_td is None:
+                logger.warning(f"Skipping announcement with missing title/date: title={title!r}")
+                continue
+
+            date_text = date_td.get_text().strip()
+            try:
+                date = datetime.datetime.strptime(date_text, "%Y-%m-%d")
+            except ValueError:
+                logger.warning(f"Skipping announcement '{title}' with unparseable date: {date_text!r}")
+                continue
+
+            unknown_labels = set(fields) - {"Dodał", "Data publikacji", "Treść"}
+            if unknown_labels:
+                logger.debug(f"Announcement '{title}' has unrecognized fields: {unknown_labels}")
+
+            author_td = fields.get("Dodał")
+            content_td = fields.get("Treść")
+            author = author_td.get_text().strip() if author_td is not None else ""
+            contents_html = str(content_td) if content_td is not None else ""
+            contents_text = content_td.get_text().strip() if content_td is not None else ""
+
+            announcements.append((title, author, date, contents_html, contents_text))
+
+        return announcements
+
 
 class LibrusNotifier:
     def __init__(self, pylibrus_config: PyLibrusConfig, librus_user: LibrusUser):
@@ -742,19 +865,26 @@ class LibrusNotifier:
             raise RuntimeError(f"Workdir {workdir_path} does not exist")
         self._engine = create_engine(f"sqlite:///{workdir_path / self._librus_user.db_name}")
         Base.metadata.create_all(self._engine)
-        self._migrate_attachment_table()
+        self._migrate_tables()
         session_maker = sessionmaker(bind=self._engine)
         self._session = session_maker()
 
-    def _migrate_attachment_table(self):
-        existing = {c["name"] for c in inspect(self._engine).get_columns("attachments")}
+    def _migrate_tables(self):
+        # Hand-rolled additive migration (no Alembic here, see CLAUDE.md): new nullable
+        # columns on any table need an explicit ALTER TABLE below, or existing users'
+        # DBs won't pick them up. `announcements` is created fresh by create_all() above
+        # for everyone, so it needs no migration today - this is the home for its future
+        # column additions.
+        inspector = inspect(self._engine)
         migrations = []
-        if "s3_key" not in existing:
-            migrations.append("ALTER TABLE attachments ADD COLUMN s3_key TEXT")
-        if "s3_upload_date" not in existing:
-            migrations.append("ALTER TABLE attachments ADD COLUMN s3_upload_date DATETIME")
-        if "s3_etag" not in existing:
-            migrations.append("ALTER TABLE attachments ADD COLUMN s3_etag TEXT")
+        if inspector.has_table("attachments"):
+            existing = {c["name"] for c in inspector.get_columns("attachments")}
+            if "s3_key" not in existing:
+                migrations.append("ALTER TABLE attachments ADD COLUMN s3_key TEXT")
+            if "s3_upload_date" not in existing:
+                migrations.append("ALTER TABLE attachments ADD COLUMN s3_upload_date DATETIME")
+            if "s3_etag" not in existing:
+                migrations.append("ALTER TABLE attachments ADD COLUMN s3_etag TEXT")
         if not migrations:
             return
         with self._engine.begin() as connection:
@@ -791,6 +921,24 @@ class LibrusNotifier:
             for attachment in attachments:
                 self._session.add(attachment)
         return msg
+
+    def get_announcement(self, url):
+        return self._session.get(LibrusAnnouncement, url)
+
+    def add_announcement(self, url, sender, subject, date, contents_html, contents_text):
+        announcement = self.get_announcement(url)
+        if not announcement:
+            announcement = LibrusAnnouncement(
+                url=url,
+                sender=sender,
+                subject=subject,
+                date=date,
+                contents_html=contents_html,
+                contents_text=contents_text,
+                content_hash=hashlib.sha1(contents_text.encode()).hexdigest(),
+            )
+            self._session.add(announcement)
+        return announcement
 
     def notify(self, msg_from_db):
         if self._librus_user.notify.is_webhook():
@@ -858,7 +1006,7 @@ class LibrusNotifier:
             dedent(f"""
         *LIBRUS {self._librus_user.name} - {msg_from_db.date}*
         *Od: {msg_from_db.sender}*
-        *Temat: {msg_from_db.subject}*
+        *{msg_from_db.webhook_item_label}: {msg_from_db.subject}*
         """)
             + f"\n{msg_from_db.contents_text}"
         )
@@ -889,7 +1037,7 @@ class LibrusNotifier:
         msg = MIMEMultipart("alternative")
         msg.set_charset("utf-8")
 
-        msg["Subject"] = f"[LIBRUS {self._librus_user.name}] {msg_from_db.subject}"
+        msg["Subject"] = f"[LIBRUS {self._librus_user.name}] {msg_from_db.subject_prefix}{msg_from_db.subject}"
         msg["From"] = self.format_sender(msg_from_db.sender, self._librus_user.notify.smtp_user)
         msg["To"] = ", ".join(self._librus_user.notify.email_dest)
 
@@ -925,14 +1073,14 @@ class LibrusNotifier:
 
 -------------------
 
-!! TO WIADOMOŚĆ Z LIBRUSA, NIE ODPOWIADAJ NA NIĄ MEJLEM !!!
+!! {msg_from_db.banner_text} !!!
 Data wysłania: {msg_from_db.date}
 
 -------------------
 
 """
 
-        header_as_html_msg = f"""<br/><h3>!!! To wiadomość z Librusa, nie odpowiadaj na nią mejlem!!!</h3>
+        header_as_html_msg = f"""<br/><h3>!!! {msg_from_db.banner_html}!!!</h3>
 <br><br>
 <b> Data wysłania:</b> {msg_from_db.date} <br>
 <hr>
@@ -984,6 +1132,17 @@ def send_test_notification(pylibrus_config: PyLibrusConfig, librus_user: LibrusU
     )
     logger.info("Sending testing notify")
     notifier.notify(msg)
+
+    announcement = LibrusAnnouncement(
+        url=announcement_id("Testing announcement", "Testing author", datetime.datetime.now()),
+        sender="Testing author Żółta Jaźń [Dyrektor]",
+        subject="Testing announcement with żółta jaźć",
+        date=datetime.datetime.now(),
+        contents_html="<p>html announcement content with żółta jażń</p>",
+        contents_text="text announcement content with żółta jaźń",
+    )
+    logger.info("Sending testing announcement notify")
+    notifier.notify(announcement)
     return 2
 
 
@@ -1023,7 +1182,7 @@ def handle_user(pylibrus_config: PyLibrusConfig, librus_user: LibrusUser, dry_ru
                     # Do not notify and do not touch msg.email_sent, so a regular (non-dry) run
                     # afterwards still sends this message normally.
                     already_sent = "yes" if msg.email_sent else "no"
-                    logger.info(f"[DRY RUN] '{msg.subject}' (already sent: {already_sent})")
+                    logger.info(f"[DRY RUN] message '{msg.subject}' (already sent: {already_sent})")
                     continue
 
                 if pylibrus_config.send_message == "unsent" and msg.email_sent:
@@ -1033,6 +1192,51 @@ def handle_user(pylibrus_config: PyLibrusConfig, librus_user: LibrusUser, dry_ru
                 else:
                     notifier.notify(msg)
                     msg.email_sent = True
+
+            fetch_announcements = (
+                librus_user.fetch_announcements
+                if librus_user.fetch_announcements is not None
+                else pylibrus_config.fetch_announcements
+            )
+            if fetch_announcements:
+                # A Librus markup change on /ogloszenia must never stop message
+                # forwarding above, which is the primary feature - see ANNOUNCEMENTS_PLAN.md.
+                try:
+                    handle_announcements(pylibrus_config, notifier, scraper, dry_run=dry_run)
+                except Exception:
+                    logger.exception("Failed to fetch/notify about announcements")
+
+
+def handle_announcements(
+    pylibrus_config: PyLibrusConfig, notifier: "LibrusNotifier", scraper: LibrusScraper, dry_run: bool = False,
+):
+    # Announcements have no stable id and no per-item read/unread flag, so unlike
+    # messages they always dedupe the "unsent" way regardless of `send_message`
+    # (see ANNOUNCEMENTS_PLAN.md).
+    announcements = scraper.fetch_announcements()
+    for title, author, date, contents_html, contents_text in reversed(announcements):
+        age = datetime.datetime.now() - date
+        if age > datetime.timedelta(days=pylibrus_config.max_age_of_sending_announcement_days):
+            logger.info(f"Do not send announcement '{title}' (too old, {date})")
+            continue
+
+        url = announcement_id(title, author, date)
+        announcement = notifier.get_announcement(url)
+        if not announcement:
+            announcement = notifier.add_announcement(url, author, title, date, contents_html, contents_text)
+
+        if dry_run:
+            # Do not notify and do not touch announcement.email_sent, so a regular
+            # (non-dry) run afterwards still sends this announcement normally.
+            already_sent = "yes" if announcement.email_sent else "no"
+            logger.info(f"[DRY RUN] announcement '{title}' (already sent: {already_sent})")
+            continue
+
+        if announcement.email_sent:
+            logger.info(f"Do not send announcement '{title}' (already sent)")
+        else:
+            notifier.notify(announcement)
+            announcement.email_sent = True
 
 
 def parse_args():
