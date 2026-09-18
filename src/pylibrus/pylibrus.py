@@ -1291,13 +1291,11 @@ def main():
     if args.test_notify:
         return send_test_notification(pylibrus_config, librus_users[0])
 
-    users_to_handle = librus_users.copy()
-    random.shuffle(users_to_handle)
-    while len(users_to_handle) > 0:
-        librus_user = users_to_handle.pop(0)
+    for i, librus_user in enumerate(librus_users):
         handle_user(pylibrus_config, librus_user, dry_run=args.dry)
-        if len(users_to_handle) > 0:
+        if i != len(librus_users) - 1:
             time.sleep(pylibrus_config.sleep_between_librus_users)
+
 
 if __name__ == "__main__":
     sys.exit(main())
