@@ -130,6 +130,16 @@ class Notify(abc.ABC):
     def is_webhook() -> bool:
         return False
 
+    def destination_key(self) -> tuple:
+        """Identity of the place notifications are delivered to.
+
+        Librus users whose configs produce the same key are notified together: one message
+        sent to several children yields a single notification per destination, annotated with
+        that destination's children (see MULTI_RECIPIENT_PLAN.md). Keep this in sync when
+        adding a notification setting, the same way from_config()/from_env() are kept in sync.
+        """
+        raise NotImplementedError
+
 
 @dataclasses.dataclass(slots=True)
 class EmailNotify(Notify):
@@ -142,6 +152,9 @@ class EmailNotify(Notify):
     @staticmethod
     def is_email() -> bool:
         return True
+
+    def destination_key(self) -> tuple:
+        return "email", self.smtp_server, self.smtp_port, self.smtp_user, tuple(sorted(self.email_dest))
 
     def __post_init__(self):
         if isinstance(self.email_dest, str):
@@ -185,6 +198,13 @@ class WebhookNotify(Notify):
     @staticmethod
     def is_webhook() -> bool:
         return True
+
+    def destination_key(self) -> tuple:
+        # Deliberately keyed on the webhook URL alone. Including webhook_attachments_source
+        # would split users who post to the *same* webhook with different attachment sources
+        # into two groups, so that webhook would receive two copies of every shared message -
+        # worse than serving both from one user's attachment config. See MULTI_RECIPIENT_PLAN.md.
+        return "webhook", self.webhook
 
     def __post_init__(self):
         if not self.webhook:
@@ -906,6 +926,22 @@ class LibrusNotifier:
         else:
             self._session.rollback()
 
+    @property
+    def librus_user(self) -> LibrusUser:
+        return self._librus_user
+
+    def commit(self):
+        """Flushes pending writes now instead of at __exit__.
+
+        Several notifiers are open at once during a run (one per Librus user) and by default
+        they all point at the same SQLite file. SQLAlchemy defers BEGIN until the first DML, so
+        one session sitting on uncommitted INSERTs holds a write lock that makes the next
+        user's INSERT fail with "database is locked" - hence committing eagerly at each phase
+        boundary rather than relying on __exit__ alone. See MULTI_RECIPIENT_PLAN.md.
+        """
+        if self._session:
+            self._session.commit()
+
     def get_msg(self, url):
         return self._session.get(Msg, url)
 
@@ -944,15 +980,20 @@ class LibrusNotifier:
             self._session.add(announcement)
         return announcement
 
-    def notify(self, msg_from_db):
+    def notify(self, msg_from_db, display_name: str | None = None):
+        """Sends one item out. `display_name` overrides the Librus user name shown to the reader.
+
+        It carries the names of *every* child the item was sent to, so the reader can tell
+        whether it concerns one child or several; it defaults to this notifier's own user.
+        """
         if self._librus_user.notify.is_webhook():
             logger.info(f"Sending '{msg_from_db.subject}' to webhook from {msg_from_db.sender} ({msg_from_db.date})")
-            self.send_via_webhook(msg_from_db)
+            self.send_via_webhook(msg_from_db, display_name)
         else:
             logger.info(
                 f"Sending '{msg_from_db.subject}' to {self._librus_user.notify.email_dest} from {msg_from_db.sender}"
             )
-            self.send_email(msg_from_db)
+            self.send_email(msg_from_db, display_name)
 
     def _get_attachments(self, msg_from_db) -> list[Attachment]:
         if not self._session:
@@ -1003,12 +1044,13 @@ class LibrusNotifier:
             logger.warning(f"Failed to initialize S3 attachment storage ({ex}), fallback to Librus links")
             return self._librus_attachment_links(attachments)
 
-    def send_via_webhook(self, msg_from_db):
+    def send_via_webhook(self, msg_from_db, display_name: str | None = None):
         attachment_links = self._build_webhook_attachment_links(msg_from_db)
+        name = display_name or self._librus_user.name
 
         msg = (
             dedent(f"""
-        *LIBRUS {self._librus_user.name} - {msg_from_db.date}*
+        *LIBRUS {name} - {msg_from_db.date}*
         *Od: {msg_from_db.sender}*
         *{msg_from_db.webhook_item_label}: {msg_from_db.subject}*
         """)
@@ -1037,11 +1079,12 @@ class LibrusNotifier:
         sender_info_encoded = "=?utf-8?B?" + sender_b64.decode() + "?="
         return f'"{sender_info_encoded}" <{sender_email}>'
 
-    def send_email(self, msg_from_db):
+    def send_email(self, msg_from_db, display_name: str | None = None):
         msg = MIMEMultipart("alternative")
         msg.set_charset("utf-8")
 
-        msg["Subject"] = f"[LIBRUS {self._librus_user.name}] {msg_from_db.subject_prefix}{msg_from_db.subject}"
+        name = display_name or self._librus_user.name
+        msg["Subject"] = f"[LIBRUS {name}] {msg_from_db.subject_prefix}{msg_from_db.subject}"
         msg["From"] = self.format_sender(msg_from_db.sender, self._librus_user.notify.smtp_user)
         msg["To"] = ", ".join(self._librus_user.notify.email_dest)
 
