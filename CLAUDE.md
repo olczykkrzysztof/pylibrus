@@ -24,9 +24,12 @@ uv run ruff check .                       # lint
 uv run ruff format .                      # format
 ```
 
-There is no test suite (`--test-notify` is the closest thing to an integration smoke test —
-it exercises `LibrusNotifier.notify()` for the first user in the config without touching the
-Librus site). When adding tests, there's no existing convention to follow.
+Tests live in `tests/` (`uv run pytest`). They use fake scrapers and a `LibrusNotifier`
+subclass that records instead of sending, so no test touches the network or SMTP, but the DBs
+are real SQLite files in `tmp_path` — several behaviours (cross-session visibility, write
+locking) only reproduce against a real shared file. Shared config fixtures are in
+`tests/conftest.py`. `--test-notify` is a manual smoke test on top of that: it exercises
+`LibrusNotifier.notify()` for the first configured user without touching the Librus site.
 
 `ruff` config lives in `pyproject.toml` (line length 120, py312 target, double quotes).
 
@@ -53,13 +56,51 @@ managers:
   BeautifulSoup (there is no real API; page structure is brittle and tied to Librus's markup).
   Session cookies are cached to a JSON file (`pylibrus_cookies.json` by default) and reused
   across runs to avoid re-login on every cron tick; `are_cookies_valid()` checks first.
-- **`LibrusNotifier`** — owns a SQLAlchemy/SQLite session (one DB file per user, `db_name` in
-  config) recording every seen `Msg`/`Attachment`/`LibrusAnnouncement` so items are never
-  processed twice, then sends new ones out via email (`smtplib`) or webhook (`requests.post`,
-  Slack-style `{"text": ...}` payload).
+- **`LibrusNotifier`** — owns a SQLAlchemy/SQLite session (`db_name`, which falls back to
+  `[global]`, so by default every user shares **one** file) recording every seen
+  `Msg`/`Attachment`/`LibrusAnnouncement` so items are never processed twice, then sends new
+  ones out via email (`smtplib`) or webhook (`requests.post`, Slack-style `{"text": ...}`
+  payload).
 
-`handle_user()` decides per-message whether to notify based on `send_message` config
-(`"unread"` vs `"unsent"`) and `max_age_of_sending_msg_days`, then marks `msg.email_sent`.
+### The run is two phases, not one pass per user
+
+`main()` **collects every user first, then notifies** — it does not scrape-and-send per user.
+This exists so that a message the school sent to several children can be annotated with all of
+them: while the first child is still being scraped, nothing yet knows the second child received
+the same message. See `MULTI_RECIPIENT_PLAN.md` for the full rationale.
+
+- `collect_user()` scrapes and stores one user's messages and announcements, notifying nothing,
+  and returns a `UserCollection` of `CollectedItem`s. It takes the scraper and notifier as
+  arguments (not locals) so both phases are testable with fakes.
+- `notify_collected()` then groups by `Notify.destination_key()` and, within a destination, by
+  item `url`, and sends **one notification per (destination, item)** labelled with that
+  destination's children (`display_name` on `notify()`/`send_email()`/`send_via_webhook()`).
+  Two children on one address and three on another therefore get one grouped notification each,
+  naming only their own children. Items go out oldest first.
+- The send rule (`should_notify_group()`) is the old per-message dispatch lifted to a group:
+  `"unsent"` and announcements skip what `email_sent` marks; `"unread"` decides purely from the
+  unread state scraped from Librus and deliberately **ignores** `email_sent`, so an unread item
+  is re-sent every run until somebody opens it. Do not "fix" that into an `email_sent` check.
+- `handle_user()` and `handle_announcements()` remain single-user wrappers; grouping across
+  children needs `main()`'s loop.
+
+Three constraints that are easy to break:
+
+1. **`Notify.destination_key()` must be kept in sync** when adding a notification setting, like
+   `from_config()`/`from_env()`. `WebhookNotify` keys on the URL *alone* on purpose — including
+   `webhook_attachments_source` would split users who share a webhook and post two copies to it.
+2. **`CollectedItem.email_sent` is a snapshot** taken during collect. Children on different
+   destinations share one `Msg` row, so reading the live column instead would let the first
+   destination's send mark that row and mute every other destination.
+3. **`LibrusNotifier.commit()` at each phase boundary.** Several notifiers are open at once
+   against (by default) one SQLite file, and SQLAlchemy defers `BEGIN` until the first DML, so a
+   session holding uncommitted `INSERT`s makes the next user's `INSERT` fail with
+   `database is locked`.
+
+Users are visited in config order; the earlier random shuffle was reverted, because the
+representative user per destination group — which fixes the sending account and the name order
+in the label — must not vary between runs. A user whose scrape raises is logged and skipped so
+the other children are still notified.
 
 ### Announcements
 

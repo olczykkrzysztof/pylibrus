@@ -36,8 +36,17 @@
 # debug=false
 
 ; This parameter tell pylibrus how long it should sleep
-; between next Librus users so that new connection is not throttled
+; between next Librus users so that new connection is not throttled.
+; NOTE: all users are scraped before anything is sent (so that a message received by
+; several children can be annotated with all of them), so this delays notifications by
+; up to sleep_between_librus_users x (number of users - 1).
 # sleep_between_librus_users=180
+
+; When the school sends one message to several children, each child's account receives its
+; own copy. pyLibrus sends one notification per destination instead of one per child, and
+; names every child of that destination it was sent to, e.g. "[LIBRUS Ania, Jas] ...".
+; Children configured with different email_dest/webhook each get their own grouped copy
+; naming only their own children. Nothing to configure - see MULTI_RECIPIENT_PLAN.md.
 
 ; This is example configuration for forwarding messages to email
 [user:ChildName]
