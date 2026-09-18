@@ -59,6 +59,31 @@ different from messages, because Librus exposes announcements differently:
 
 See [`ANNOUNCEMENTS_PLAN.md`](ANNOUNCEMENTS_PLAN.md) for the full design rationale.
 
+## Messages sent to several children
+
+The school often sends one message to several children. Each child's Librus account receives
+its own copy, but pyLibrus forwards **one** notification per destination rather than one per
+child, and the subject names every child it was sent to:
+
+```
+[LIBRUS Ania, Jaś] Zebranie z rodzicami
+```
+
+so you can tell at a glance whether a message concerns one child or several. A message that
+reached only one child names only that child, exactly as before.
+
+Each destination is told only about the children configured to it: with two children forwarded
+to one address and three to another, each address receives a single grouped notification naming
+its own children. Children on separate `db_name` files are grouped too.
+
+One consequence of collecting every child before sending: notifications arrive only after all
+children have been scraped, so with several children and a large `sleep_between_librus_users`
+they land a few minutes later than they used to.
+
+See [`MULTI_RECIPIENT_PLAN.md`](MULTI_RECIPIENT_PLAN.md) for the design rationale, including
+what is deliberately *not* handled — if one child's scrape fails, the message goes out labelled
+with the children that were scraped successfully and is not relabelled later.
+
 ## Potential improvements
 
 * support HTML messages
