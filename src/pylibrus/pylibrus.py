@@ -1200,6 +1200,7 @@ class CollectedItem:
 
     item: Msg | LibrusAnnouncement
     read: bool | None  # per-user unread state from the folder listing; None for announcements
+    email_sent: bool = False  # as it stood when collected, i.e. before anything this run was sent
 
 
 @dataclasses.dataclass
@@ -1259,7 +1260,7 @@ def collect_user(
                 attachments,
             )
 
-        collection.items.append(CollectedItem(item=msg, read=read))
+        collection.items.append(CollectedItem(item=msg, read=read, email_sent=bool(msg.email_sent)))
 
     fetch_announcements = (
         librus_user.fetch_announcements
@@ -1295,7 +1296,7 @@ def collect_announcements(
         announcement = notifier.get_announcement(url)
         if not announcement:
             announcement = notifier.add_announcement(url, author, title, date, contents_html, contents_text)
-        collected.append(CollectedItem(item=announcement, read=None))
+        collected.append(CollectedItem(item=announcement, read=None, email_sent=bool(announcement.email_sent)))
     return collected
 
 
@@ -1335,6 +1336,11 @@ def should_notify_group(pylibrus_config: PyLibrusConfig, group: ItemGroup) -> tu
     In "unread" mode the decision belongs to the unread state on Librus rather than to our own
     email_sent bookkeeping, so an item nobody has read yet is re-sent on every run - that is
     the mode working as intended, and email_sent is deliberately not consulted.
+
+    Reads CollectedItem.email_sent, the value captured during collect, never the live column.
+    Children on different destinations share one Msg row, so consulting the column would let
+    the first destination's send mark that row and mute every later destination - only one
+    destination would ever be notified. See MULTI_RECIPIENT_PLAN.md.
     """
     # Announcements have no per-item read/unread flag, so they always dedupe the "unsent" way
     # regardless of send_message - see ANNOUNCEMENTS_PLAN.md.
@@ -1345,7 +1351,7 @@ def should_notify_group(pylibrus_config: PyLibrusConfig, group: ItemGroup) -> tu
             return False, "already read"
         return True, ""
 
-    if any(collected.item.email_sent for _, collected in group):
+    if any(collected.email_sent for _, collected in group):
         return False, "already sent"
     return True, ""
 
@@ -1372,6 +1378,7 @@ def notify_group(
     representative.notifier.notify(item, display_name=display_name)
     for collection, collected in group:
         collected.item.email_sent = True
+        collected.email_sent = True
         collection.notifier.commit()
 
 
@@ -1403,17 +1410,10 @@ def notify_collected(pylibrus_config: PyLibrusConfig, collections: list[UserColl
     about the children it is configured for: with two children forwarded to one address and
     three to another, each address gets one grouped notification naming its own children.
     """
-    groups = [
-        group
-        for destination_collections in group_by_destination(collections).values()
-        for group in group_items_by_url(destination_collections)
-    ]
-    # Decide for every destination *before* sending to any of them. Children on different
-    # destinations share one Msg row, so a decision taken after the first destination's send
-    # would see the email_sent that send had just written and skip every other destination.
-    decisions = [should_notify_group(pylibrus_config, group) for group in groups]
-    for group, (should_notify, reason) in zip(groups, decisions):
-        notify_group(pylibrus_config, group, should_notify, reason, dry_run=dry_run)
+    for destination_collections in group_by_destination(collections).values():
+        for group in group_items_by_url(destination_collections):
+            should_notify, reason = should_notify_group(pylibrus_config, group)
+            notify_group(pylibrus_config, group, should_notify, reason, dry_run=dry_run)
 
 
 def handle_user(pylibrus_config: PyLibrusConfig, librus_user: LibrusUser, dry_run: bool = False):

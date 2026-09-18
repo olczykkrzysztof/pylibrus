@@ -150,14 +150,20 @@ today's per-message dispatch, with no change to either mode's criterion:
   `unread` mode that flag is written but not read back, exactly as today; it stays meaningful
   if the config later switches to `unsent`.
 
-**All destinations are decided before any of them is sent to.** Found while implementing: the
-per-destination fan-out and the shared `Msg.url` row interact badly if the send decision is
-taken group by group. Children on different destinations share *one* row, so the first
-destination's send writes `email_sent=True`, and the next destination's group — whose session
-re-reads the row after that commit — sees "already sent" and is silently skipped. Exactly one
-destination would ever be notified. So `notify_collected()` evaluates the send rule for **every**
-group first, then sends, so each destination is judged against the state as it was before any
-send in this run.
+**`email_sent` is snapshotted at collect time.** Found while implementing: the
+per-destination fan-out and the shared `Msg.url` row interact badly if the send rule reads the
+live column. Children on different destinations share *one* row, so the first destination's send
+writes `email_sent=True` and the next destination's group — whose session re-reads the row after
+that commit — sees "already sent" and is silently skipped. Exactly one destination would ever be
+notified.
+
+So `CollectedItem` carries the flag's value **as it stood when collected**, before anything in
+this run was sent, and the send rule consults that rather than `collected.item.email_sent`. An
+earlier attempt evaluated every group's decision up front instead; that happened to work, but
+only because building the group list first refreshed each session's instances and opened their
+read snapshots before the first write — correctness resting on SQLAlchemy expiry timing, which
+a later refactor would have broken silently. The explicit snapshot is a field, not a timing
+accident, and §4 test 5 fails if it is swapped back for the live column.
 
 **The label is the recipient list, not the unread list.** A group is labelled with every child
 of that destination who *received* the item, regardless of who has read it. In `unread` mode a
@@ -384,8 +390,8 @@ convention from `tests/test_handle_announcements.py`:
 4. Message present for one user only → labelled with that user alone (no regression).
 5. `unsent` mode, second run → nothing sent.
 6. `unread` mode: item unread for user B and already `email_sent` → **is** re-sent, once,
-   labelled with both children (§1.2 — pins the intended behaviour so a later refactor does
-   not "fix" it into an `email_sent` check).
+   labelled with both children, and stops only once every child has read it (§1.2 — pins the
+   intended behaviour so a later refactor does not "fix" it into an `email_sent` check).
 7. Announcements grouped identically, keyed on `announcement_id()`.
 8. `--dry` → no notify calls, `email_sent` untouched on every member.
 9. Groups delivered in `date` order (D10).
@@ -398,6 +404,12 @@ convention from `tests/test_handle_announcements.py`:
 13. **Representative determinism (D6/D11):** the chosen representative, the SMTP account used
     and the name order in the label all follow config order and are stable across repeated
     runs over the same config.
+
+Delivered as `tests/test_multi_recipient.py` (14 tests) plus shared config fixtures in
+`tests/conftest.py`. Each test was checked against a mutation of the behaviour it covers — the
+live-column read, the date sort, the eager commit, the joined label, the destination bucketing,
+an `email_sent` check leaking into `unread` mode, and a dry run that marks items sent — so none
+of them passes vacuously.
 
 Plus `uv run ruff check .` / `uv run ruff format .`, and a manual `--dry` run against the
 live config to confirm the grouping the logs report matches expectations before a real send.
