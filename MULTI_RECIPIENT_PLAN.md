@@ -150,6 +150,15 @@ today's per-message dispatch, with no change to either mode's criterion:
   `unread` mode that flag is written but not read back, exactly as today; it stays meaningful
   if the config later switches to `unsent`.
 
+**All destinations are decided before any of them is sent to.** Found while implementing: the
+per-destination fan-out and the shared `Msg.url` row interact badly if the send decision is
+taken group by group. Children on different destinations share *one* row, so the first
+destination's send writes `email_sent=True`, and the next destination's group — whose session
+re-reads the row after that commit — sees "already sent" and is silently skipped. Exactly one
+destination would ever be notified. So `notify_collected()` evaluates the send rule for **every**
+group first, then sends, so each destination is judged against the state as it was before any
+send in this run.
+
 **The label is the recipient list, not the unread list.** A group is labelled with every child
 of that destination who *received* the item, regardless of who has read it. In `unread` mode a
 re-send on a later tick therefore carries the same label as the first send. Labelling only the

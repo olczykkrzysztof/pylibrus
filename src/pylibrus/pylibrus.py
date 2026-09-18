@@ -2,6 +2,7 @@ import abc
 import argparse
 import base64
 import configparser
+import contextlib
 import dataclasses
 import datetime
 import hashlib
@@ -1193,74 +1194,97 @@ def send_test_notification(pylibrus_config: PyLibrusConfig, librus_user: LibrusU
     return 2
 
 
-def handle_user(pylibrus_config: PyLibrusConfig, librus_user: LibrusUser, dry_run: bool = False):
-    with LibrusScraper(librus_user.login, librus_user.password, pylibrus_config=pylibrus_config) as scraper:
-        with LibrusNotifier(pylibrus_config, librus_user) as notifier:
-            msgs = scraper.msgs_from_folder(pylibrus_config.inbox_folder_id)
-            for msg_path, read in msgs:
-                msg = notifier.get_msg(msg_path)
+@dataclasses.dataclass
+class CollectedItem:
+    """One message or announcement as seen by one Librus user during the collect phase."""
 
-                if not msg:
-                    logger.debug(f"Fetch {msg_path}")
+    item: Msg | LibrusAnnouncement
+    read: bool | None  # per-user unread state from the folder listing; None for announcements
 
-                    fetch_attachment_content = pylibrus_config.fetch_attachments and (
-                        librus_user.notify.is_email()
-                        or (
-                            librus_user.notify.is_webhook()
-                            and is_s3_webhook_source(librus_user.notify.webhook_attachments_source)
-                        )
-                    )
-                    msg_content_or_none = scraper.fetch_msg(msg_path, fetch_attachment_content)
-                    if msg_content_or_none is None:
-                        continue
-                    sender, subject, date, contents_html, contents_text, attachments = msg_content_or_none
-                    msg = notifier.add_msg(
-                        msg_path,
-                        pylibrus_config.inbox_folder_id,
-                        sender,
-                        date,
-                        subject,
-                        contents_html,
-                        contents_text,
-                        attachments,
-                    )
 
-                if dry_run:
-                    # Do not notify and do not touch msg.email_sent, so a regular (non-dry) run
-                    # afterwards still sends this message normally.
-                    already_sent = "yes" if msg.email_sent else "no"
-                    logger.info(f"[DRY RUN] message '{msg.subject}' (already sent: {already_sent})")
-                    continue
+@dataclasses.dataclass
+class UserCollection:
+    """Everything one Librus user received in this run, with the notifier that owns the rows.
 
-                if pylibrus_config.send_message == "unsent" and msg.email_sent:
-                    logger.info(f"Do not send '{msg.subject}' (message already sent)")
-                elif pylibrus_config.send_message == "unread" and read:
-                    logger.info(f"Do not send '{msg.subject}' (message already read)")
-                else:
-                    notifier.notify(msg)
-                    msg.email_sent = True
+    The notifier has to be carried along: its session owns `item`, and its LibrusUser holds
+    the credentials and destination config needed to send.
+    """
 
-            fetch_announcements = (
-                librus_user.fetch_announcements
-                if librus_user.fetch_announcements is not None
-                else pylibrus_config.fetch_announcements
+    librus_user: LibrusUser
+    notifier: "LibrusNotifier"
+    items: list[CollectedItem] = dataclasses.field(default_factory=list)
+
+
+def collect_user(
+    pylibrus_config: PyLibrusConfig, librus_user: LibrusUser, scraper: LibrusScraper, notifier: "LibrusNotifier",
+) -> UserCollection:
+    """Scrapes and stores everything new for one user, notifying nothing.
+
+    Splitting collect from notify is what makes the multi-recipient annotation possible at all:
+    while a single pass is still scraping the first child, nothing yet knows that the second
+    child received the same message, so there is no way to label it correctly. See
+    MULTI_RECIPIENT_PLAN.md.
+
+    The scraper and notifier are arguments rather than locals so that both phases can be
+    driven with fakes in tests, the way handle_announcements() already could be.
+    """
+    collection = UserCollection(librus_user=librus_user, notifier=notifier)
+
+    msgs = scraper.msgs_from_folder(pylibrus_config.inbox_folder_id)
+    for msg_path, read in msgs:
+        msg = notifier.get_msg(msg_path)
+
+        if not msg:
+            logger.debug(f"Fetch {msg_path}")
+
+            fetch_attachment_content = pylibrus_config.fetch_attachments and (
+                librus_user.notify.is_email()
+                or (
+                    librus_user.notify.is_webhook()
+                    and is_s3_webhook_source(librus_user.notify.webhook_attachments_source)
+                )
             )
-            if fetch_announcements:
-                # A Librus markup change on /ogloszenia must never stop message
-                # forwarding above, which is the primary feature - see ANNOUNCEMENTS_PLAN.md.
-                try:
-                    handle_announcements(pylibrus_config, notifier, scraper, dry_run=dry_run)
-                except Exception:
-                    logger.exception("Failed to fetch/notify about announcements")
+            msg_content_or_none = scraper.fetch_msg(msg_path, fetch_attachment_content)
+            if msg_content_or_none is None:
+                continue
+            sender, subject, date, contents_html, contents_text, attachments = msg_content_or_none
+            msg = notifier.add_msg(
+                msg_path,
+                pylibrus_config.inbox_folder_id,
+                sender,
+                date,
+                subject,
+                contents_html,
+                contents_text,
+                attachments,
+            )
+
+        collection.items.append(CollectedItem(item=msg, read=read))
+
+    fetch_announcements = (
+        librus_user.fetch_announcements
+        if librus_user.fetch_announcements is not None
+        else pylibrus_config.fetch_announcements
+    )
+    if fetch_announcements:
+        # A Librus markup change on /ogloszenia must never stop message
+        # forwarding above, which is the primary feature - see ANNOUNCEMENTS_PLAN.md.
+        try:
+            collection.items.extend(collect_announcements(pylibrus_config, notifier, scraper))
+        except Exception:
+            logger.exception("Failed to fetch announcements")
+
+    # Do not leave an open write transaction behind while the next user's session writes to
+    # the same SQLite file - see LibrusNotifier.commit().
+    notifier.commit()
+    return collection
 
 
-def handle_announcements(
-    pylibrus_config: PyLibrusConfig, notifier: "LibrusNotifier", scraper: LibrusScraper, dry_run: bool = False,
-):
-    # Announcements have no stable id and no per-item read/unread flag, so unlike
-    # messages they always dedupe the "unsent" way regardless of `send_message`
-    # (see ANNOUNCEMENTS_PLAN.md).
+def collect_announcements(
+    pylibrus_config: PyLibrusConfig, notifier: "LibrusNotifier", scraper: LibrusScraper,
+) -> list[CollectedItem]:
     announcements = scraper.fetch_announcements()
+    collected = []
     for title, author, date, contents_html, contents_text in reversed(announcements):
         age = datetime.datetime.now() - date
         if age > datetime.timedelta(days=pylibrus_config.max_age_of_sending_announcement_days):
@@ -1271,19 +1295,145 @@ def handle_announcements(
         announcement = notifier.get_announcement(url)
         if not announcement:
             announcement = notifier.add_announcement(url, author, title, date, contents_html, contents_text)
+        collected.append(CollectedItem(item=announcement, read=None))
+    return collected
 
-        if dry_run:
-            # Do not notify and do not touch announcement.email_sent, so a regular
-            # (non-dry) run afterwards still sends this announcement normally.
-            already_sent = "yes" if announcement.email_sent else "no"
-            logger.info(f"[DRY RUN] announcement '{title}' (already sent: {already_sent})")
-            continue
 
-        if announcement.email_sent:
-            logger.info(f"Do not send announcement '{title}' (already sent)")
-        else:
-            notifier.notify(announcement)
-            announcement.email_sent = True
+ItemGroup = list[tuple[UserCollection, CollectedItem]]
+
+
+def group_by_destination(collections: list[UserCollection]) -> dict[tuple, list[UserCollection]]:
+    """Buckets users by where their notifications go.
+
+    Insertion order is config order (the run no longer shuffles users), and dict preserves it,
+    so each group's first member is its representative - which fixes the sending account and
+    the order names appear in the label. See MULTI_RECIPIENT_PLAN.md.
+    """
+    groups: dict[tuple, list[UserCollection]] = {}
+    for collection in collections:
+        groups.setdefault(collection.librus_user.notify.destination_key(), []).append(collection)
+    return groups
+
+
+def group_items_by_url(destination_collections: list[UserCollection]) -> list[ItemGroup]:
+    """Groups one destination's items by url, oldest first.
+
+    Librus gives the same message the same path in every child's account, so an equal `url` is
+    what identifies one item received by several children (for announcements it is the
+    synthetic announcement_id, equal across children by construction).
+    """
+    groups: dict[str, ItemGroup] = {}
+    for collection in destination_collections:
+        for collected in collection.items:
+            groups.setdefault(collected.item.url, []).append((collection, collected))
+    return sorted(groups.values(), key=lambda group: group[0][1].item.date)
+
+
+def should_notify_group(pylibrus_config: PyLibrusConfig, group: ItemGroup) -> tuple[bool, str]:
+    """Per-group lift of the old per-message dispatch; neither mode's criterion changes.
+
+    In "unread" mode the decision belongs to the unread state on Librus rather than to our own
+    email_sent bookkeeping, so an item nobody has read yet is re-sent on every run - that is
+    the mode working as intended, and email_sent is deliberately not consulted.
+    """
+    # Announcements have no per-item read/unread flag, so they always dedupe the "unsent" way
+    # regardless of send_message - see ANNOUNCEMENTS_PLAN.md.
+    is_announcement = group[0][1].read is None
+
+    if pylibrus_config.send_message == "unread" and not is_announcement:
+        if all(collected.read for _, collected in group):
+            return False, "already read"
+        return True, ""
+
+    if any(collected.item.email_sent for _, collected in group):
+        return False, "already sent"
+    return True, ""
+
+
+def notify_group(
+    pylibrus_config: PyLibrusConfig, group: ItemGroup, should_notify: bool, reason: str, dry_run: bool = False,
+):
+    representative, first = group[0]
+    item = first.item
+    display_name = ", ".join(collection.librus_user.name for collection, _ in group)
+
+    if dry_run:
+        # Do not notify and do not touch email_sent, so a regular (non-dry) run afterwards
+        # still sends this item normally.
+        verdict = "would send" if should_notify else f"would skip ({reason})"
+        logger.info(f"[DRY RUN] '{item.subject}' for {display_name}: {verdict}")
+        return
+
+    if not should_notify:
+        logger.info(f"Do not send '{item.subject}' for {display_name} ({reason})")
+        return
+
+    warn_on_mixed_attachments_source(group)
+    representative.notifier.notify(item, display_name=display_name)
+    for collection, collected in group:
+        collected.item.email_sent = True
+        collection.notifier.commit()
+
+
+def warn_on_mixed_attachments_source(group: ItemGroup):
+    """Warns when users grouped onto one webhook disagree on where attachments come from.
+
+    destination_key() groups them on purpose (see WebhookNotify.destination_key), but only the
+    representative's attachment config is used, so say so rather than silently picking one.
+    """
+    sources = {
+        collection.librus_user.notify.webhook_attachments_source
+        for collection, _ in group
+        if collection.librus_user.notify.is_webhook()
+    }
+    if len(sources) > 1:
+        representative = group[0][0].librus_user.name
+        logger.warning(
+            f"Users sharing one webhook disagree on webhook_attachments_source ({sorted(sources)}), "
+            f"using {representative}'s",
+        )
+
+
+def notify_collected(pylibrus_config: PyLibrusConfig, collections: list[UserCollection], dry_run: bool = False):
+    """Sends one notification per (destination, item), labelled with that destination's children.
+
+    A message the school sent to several children appears in each of their accounts under the
+    same url, so it must go out once per destination rather than once per child - and say which
+    children it concerns, which is the point of the whole exercise. Each destination hears only
+    about the children it is configured for: with two children forwarded to one address and
+    three to another, each address gets one grouped notification naming its own children.
+    """
+    groups = [
+        group
+        for destination_collections in group_by_destination(collections).values()
+        for group in group_items_by_url(destination_collections)
+    ]
+    # Decide for every destination *before* sending to any of them. Children on different
+    # destinations share one Msg row, so a decision taken after the first destination's send
+    # would see the email_sent that send had just written and skip every other destination.
+    decisions = [should_notify_group(pylibrus_config, group) for group in groups]
+    for group, (should_notify, reason) in zip(groups, decisions):
+        notify_group(pylibrus_config, group, should_notify, reason, dry_run=dry_run)
+
+
+def handle_user(pylibrus_config: PyLibrusConfig, librus_user: LibrusUser, dry_run: bool = False):
+    """Collects and notifies a single user. Cross-user grouping needs main()'s loop."""
+    with LibrusScraper(librus_user.login, librus_user.password, pylibrus_config=pylibrus_config) as scraper:
+        with LibrusNotifier(pylibrus_config, librus_user) as notifier:
+            collection = collect_user(pylibrus_config, librus_user, scraper, notifier)
+            notify_collected(pylibrus_config, [collection], dry_run=dry_run)
+
+
+def handle_announcements(
+    pylibrus_config: PyLibrusConfig, notifier: "LibrusNotifier", scraper: LibrusScraper, dry_run: bool = False,
+):
+    """Collects and notifies a single user's announcements."""
+    collection = UserCollection(
+        librus_user=notifier.librus_user,
+        notifier=notifier,
+        items=collect_announcements(pylibrus_config, notifier, scraper),
+    )
+    notify_collected(pylibrus_config, [collection], dry_run=dry_run)
 
 
 def parse_args():
@@ -1334,10 +1484,26 @@ def main():
     if args.test_notify:
         return send_test_notification(pylibrus_config, librus_users[0])
 
-    for i, librus_user in enumerate(librus_users):
-        handle_user(pylibrus_config, librus_user, dry_run=args.dry)
-        if i != len(librus_users) - 1:
-            time.sleep(pylibrus_config.sleep_between_librus_users)
+    # Collect every user before notifying anyone: a message sent to several children can only
+    # be labelled with all of them once all of them have been scraped. The notifiers stay open
+    # across both phases because their sessions own the collected rows.
+    with contextlib.ExitStack() as stack:
+        collections = []
+        for i, librus_user in enumerate(librus_users):
+            try:
+                notifier = stack.enter_context(LibrusNotifier(pylibrus_config, librus_user))
+                with LibrusScraper(
+                    librus_user.login, librus_user.password, pylibrus_config=pylibrus_config,
+                ) as scraper:
+                    collections.append(collect_user(pylibrus_config, librus_user, scraper, notifier))
+            except Exception:
+                # One broken account (changed password, throttling) must not stop the other
+                # children being notified - see MULTI_RECIPIENT_PLAN.md.
+                logger.exception(f"Failed to collect messages for {librus_user.name}")
+            if i != len(librus_users) - 1:
+                time.sleep(pylibrus_config.sleep_between_librus_users)
+
+        notify_collected(pylibrus_config, collections, dry_run=args.dry)
 
 
 if __name__ == "__main__":

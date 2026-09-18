@@ -21,9 +21,11 @@ class RecordingNotifier(LibrusNotifier):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.sent_subjects = []
+        self.sent_display_names = []
 
-    def notify(self, item):
+    def notify(self, item, display_name=None):
         self.sent_subjects.append(item.subject)
+        self.sent_display_names.append(display_name)
 
 
 class FakeScraper:
