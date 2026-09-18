@@ -38,7 +38,7 @@ fetched.
 The run therefore has to be split into a **collect phase** and a **notify phase**. That is
 the substance of this change; everything else is bookkeeping.
 
-### 1.2 Second, related defect: `send_message=unread` already double-sends
+### 1.2 What `send_message=unread` does, and why it stays that way
 
 The dispatch at `pylibrus.py:1192` only consults `email_sent` in `unsent` mode:
 
@@ -51,11 +51,20 @@ else:
     notify
 ```
 
-In `unread` mode, `unread` is read from *that user's* inbox listing. Today the first user's
-`fetch_msg()` GETs the message page, which is what marks it read **in that account only**.
-For the second user the row already exists, so `fetch_msg()` is never called, that account's
-copy stays unread forever, and the message is re-notified on **every 5-minute cron tick**
-until a human opens it in Librus. This plan closes that too (see D4).
+That is **intentional and is preserved by this plan**: in `unread` mode the send decision is
+taken from the unread state on the scraped service, not from our own `email_sent` bookkeeping.
+`email_sent` is the `unsent` mode's signal; `unread` mode deliberately ignores it.
+
+The practical consequence is worth spelling out, because it interacts with the grouping below.
+`read` comes from *that user's* inbox listing. The first user's `fetch_msg()` GETs the message
+page, which marks it read **in that account only**; for a second user whose row already exists
+`fetch_msg()` is never called, so that account's copy stays unread and the item is re-notified
+on every cron tick until a human opens it in Librus. That is the mode working as designed —
+it repeats until somebody actually reads it.
+
+What the grouping *does* improve here is volume. Today, three children who all have the item
+unread produce **three** notifications per tick, each labelled with one child. Under D4 they
+produce **one** grouped notification per tick, labelled with all three.
 
 ---
 
@@ -130,13 +139,23 @@ Rejected alternatives:
   receive nothing, and `main()` shuffles the user order (`4754f06`), so which destination wins
   varies run to run.
 
-**Group send rule** (applied per destination group, per item):
+**Group send rule** (applied per destination group, per item) — a faithful per-group lift of
+today's per-message dispatch, with no change to either mode's criterion:
 - `send_message=unsent`, and announcements always: notify if **no** member of the group has
   `email_sent` set.
-- `send_message=unread`: notify if **at least one** member is unread **and** no member has
-  `email_sent` set. The added `email_sent` clause is what fixes §1.2 — deliberate behaviour
-  change for `unread` users.
-- After sending, `email_sent = True` is set on the row for **every** member of the group.
+- `send_message=unread`: notify if **at least one** member is unread. `email_sent` is
+  deliberately **not** consulted, per §1.2 — the scraped unread state is the whole signal in
+  this mode, so an item that stays unread for any child in the group keeps being sent.
+- After sending, `email_sent = True` is set on the row for **every** member of the group. In
+  `unread` mode that flag is written but not read back, exactly as today; it stays meaningful
+  if the config later switches to `unsent`.
+
+**The label is the recipient list, not the unread list.** A group is labelled with every child
+of that destination who *received* the item, regardless of who has read it. In `unread` mode a
+re-send on a later tick therefore carries the same label as the first send. Labelling only the
+still-unread children was considered and rejected: the label would then change between ticks
+(`Ania, Jaś` then `Jaś`), reintroducing exactly the "who is this about?" ambiguity this change
+exists to remove.
 
 ### D5 — Reuse the existing notification path; parameterise only the displayed name
 
@@ -163,9 +182,17 @@ This joins the list of things in `CLAUDE.md` that must be kept in sync when a no
 setting is added.
 
 `LibrusNotifier` is bound to one `LibrusUser` (it owns the SMTP credentials, the S3 config
-and the DB session), so each destination group picks a **representative** — the
-first member **in config order**, not in the shuffled run order, so delivery is deterministic
-across runs.
+and the DB session), so each destination group picks a **representative** — the first member
+**in config order**.
+
+This needs carrying explicitly, and is easy to get wrong. `main()` shuffles a *copy* of the
+user list (`librus_users.copy()`, `pylibrus.py:1294`) deliberately, so that Librus is not
+always hit in the same order (`4754f06`). Phase 1 therefore produces `UserCollection`s in
+*shuffled* order, and grouping over that order would pick a different representative — hence a
+different sending SMTP account, a different S3 config and a different name order in the label
+— on every run. So `UserCollection` carries a `config_index` (its position in the unshuffled
+`librus_users`), and phase 2 sorts by it before bucketing. The shuffle keeps affecting only
+the scrape order, which is all it was ever for.
 
 Two deliberate simplifications:
 - S3 settings are **not** part of the destination key. Two users on the same webhook with
@@ -183,9 +210,16 @@ users still open, which introduces a real hazard: SQLAlchemy defers `BEGIN` unti
 DML, so user 1's uncommitted `INSERT`s hold a write lock on the shared SQLite file while
 user 2 tries to insert → `database is locked`.
 
-So: `LibrusNotifier` gains an explicit `commit()`, called at the end of each user's collect
-phase and after each notification in phase 2. No session holds an open write transaction
-across another user's work. The existing commit-on-clean-`__exit__` stays as a backstop.
+So: `LibrusNotifier` gains an explicit `commit()`, called at the end of **each** user's
+collect phase and after **each** notification in phase 2, so that no session ever holds an
+open write transaction while another user's session writes. The existing
+commit-on-clean-`__exit__` (`pylibrus.py:902`) stays as a backstop.
+
+Note this is only a hazard because the users share one SQLite *file* by default; it is not a
+hazard the current code can hit, since today exactly one notifier exists at a time. It is
+introduced by D1 and must be closed in the same commit. §4 test 12 covers it against a real
+shared file rather than a mock, since an in-memory or per-test-DB fake would never reproduce
+the lock.
 
 ### D8 — A failed user does not block the others
 
@@ -241,6 +275,7 @@ class CollectedItem:
 class UserCollection:
     librus_user: LibrusUser
     notifier: LibrusNotifier
+    config_index: int                # position in the unshuffled librus_users list, see D6
     items: list[CollectedItem]
 ```
 
@@ -249,34 +284,52 @@ scraper and notifier as **parameters** — mirroring `handle_announcements()`
 (`pylibrus.py:1214`), which is the only currently unit-testable part of the pipeline — so the
 tests can inject fakes. It contains today's `handle_user()` body from `msgs_from_folder()`
 down to `add_msg()`, minus every `notify()` / `email_sent` line, plus the announcement
-collection (keeping the broad `try/except` around announcements, `pylibrus.py:1208`).
+collection (keeping the broad `try/except` around announcements, `pylibrus.py:1208`). It ends
+with `notifier.commit()` (D7).
+
+Taking the scraper and notifier as arguments is what makes this testable at all: today
+`handle_user()` constructs `LibrusScraper` itself (`pylibrus.py:1154`), which is why no test
+covers it, while `handle_announcements()` — which receives both — has a test file of its own.
+Phase 2 is then testable without any fake at all, since `notify_collected()` consumes plain
+`UserCollection` records.
 
 ### Step 4 — Notify phase
 
 `notify_collected(pylibrus_config, collections, dry_run=False)`:
 
-1. bucket `collections` by `librus_user.notify.destination_key()`, preserving config order;
+1. sort `collections` by `config_index` (D6), then bucket by
+   `librus_user.notify.destination_key()`;
 2. within each bucket, bucket `CollectedItem`s by `item.url`;
 3. sort groups by `item.date` (D10);
-4. apply the D4 send rule; on send, use the representative's notifier with
-   `display_name=", ".join(names)`, then set `email_sent` on every member and `commit()`.
+4. apply the D4 send rule; on send, use the representative's notifier (the group's first
+   member, now genuinely in config order) with `display_name=", ".join(names)`, then set
+   `email_sent` on every member and `commit()` each affected session (D7);
+5. warn when members of one webhook group disagree on `webhook_attachments_source` (D6).
 
 ### Step 5 — Rewire `main()` (`pylibrus.py:1281`)
 
 ```python
+config_index = {user.name: i for i, user in enumerate(librus_users)}   # unshuffled, D6
+
 with contextlib.ExitStack() as stack:
     collections = []
-    for librus_user in users_to_handle:          # still shuffled
+    for librus_user in users_to_handle:          # still shuffled: scrape order only
         try:
             notifier = stack.enter_context(LibrusNotifier(pylibrus_config, librus_user))
             with LibrusScraper(...) as scraper:
-                collections.append(collect_user(pylibrus_config, librus_user, scraper, notifier))
+                collections.append(collect_user(
+                    pylibrus_config, librus_user, scraper, notifier,
+                    config_index=config_index[librus_user.name],
+                ))
         except Exception:
             logger.exception(f"Failed to collect for {librus_user.name}")   # D8
         if more users remain:
             time.sleep(pylibrus_config.sleep_between_librus_users)
     notify_collected(pylibrus_config, collections, dry_run=args.dry)
 ```
+
+`config_index` is keyed on `name`, which is the `[user:<Name>]` section name and therefore
+already unique per config.
 
 Keep `handle_user()` as a thin single-user wrapper (`collect_user` + `notify_collected` on a
 one-element list) so the existing entry point and its semantics survive.
@@ -306,13 +359,21 @@ convention from `tests/test_handle_announcements.py`:
    `"A1, A2"` and `"B1, B2, B3"` respectively.
 4. Message present for one user only → labelled with that user alone (no regression).
 5. `unsent` mode, second run → nothing sent.
-6. `unread` mode: item unread for user B but already `email_sent` → **not** re-sent
-   (regression test for §1.2).
+6. `unread` mode: item unread for user B and already `email_sent` → **is** re-sent, once,
+   labelled with both children (§1.2 — pins the intended behaviour so a later refactor does
+   not "fix" it into an `email_sent` check).
 7. Announcements grouped identically, keyed on `announcement_id()`.
 8. `--dry` → no notify calls, `email_sent` untouched on every member.
 9. Groups delivered in `date` order (D10).
 10. Users with **different** `db_name` files still group correctly (D2's side effect).
 11. A user raising during collect does not prevent the others being notified (D8).
+12. **Shared-DB locking (D7):** two users on the *same* `db_name` file, both collecting new
+    messages, then both notified — must complete without `sqlite3.OperationalError: database
+    is locked`. Use a real file in `tmp_path`, as `tests/test_handle_announcements.py`
+    already does; a per-test or in-memory DB would not reproduce the lock.
+13. **Representative determinism (D6):** with the user list passed in shuffled order, the
+    chosen representative, the SMTP account used and the name order in the label are all
+    identical across runs and follow config order, not scrape order.
 
 Plus `uv run ruff check .` / `uv run ruff format .`, and a manual `--dry` run against the
 live config to confirm the grouping the logs report matches expectations before a real send.
@@ -346,11 +407,16 @@ to a bug if Librus changes it.
 
 See D1 — up to `sleep_between_librus_users x (n_users - 1)`.
 
-### 5.4 `unread` mode changes behaviour
+### 5.4 `unread` mode keeps repeating until read — **by design, unchanged**
 
-See D4's send rule. A message sent while unread will no longer be re-sent on subsequent
-ticks. This is the fix for §1.2, but it *is* a semantic change for anyone relying on the
-repeat-until-read behaviour.
+See §1.2 and D4's send rule. In `unread` mode an item that stays unread in any child's account
+is re-sent every tick, because the send decision belongs to the scraped service's unread state
+rather than to our `email_sent` flag. This plan deliberately does **not** change that; it only
+collapses what used to be one notification per unread child per tick into one grouped
+notification per tick.
+
+Noted here so that it is on the record as a decision rather than an oversight: a future reader
+finding `email_sent` written but never read in `unread` mode should leave it alone.
 
 ### 5.5 Sessions held open across the whole run
 
@@ -365,7 +431,7 @@ change that adds DB writes inside the collect phase must not leave a transaction
    no behaviour change, `display_name` unused).
 2. `refactor: split handle_user() into collect and notify phases` (Steps 3–5, single-user
    behaviour identical).
-3. `feat: label notifications with every child a message was sent to` (D4 grouping + the
-   `unread` send-rule fix).
+3. `feat: label notifications with every child a message was sent to` (D4 grouping; both
+   modes' send criteria unchanged from today).
 4. `test: cover multi-recipient grouping and destination fan-out` (Step 4 / §4).
 5. `docs: describe the two-phase run and destination grouping` (Step 6).
