@@ -136,8 +136,8 @@ Rejected alternatives:
 - *One copy per destination naming **all** children* — identical machinery, but leaks names
   of children a destination is not configured for.
 - *One copy total, first user's destination wins* — children on other destinations silently
-  receive nothing, and `main()` shuffles the user order (`4754f06`), so which destination wins
-  varies run to run.
+  receive nothing, and which destination wins becomes an accident of config ordering (before
+  D11 it was outright random).
 
 **Group send rule** (applied per destination group, per item) — a faithful per-group lift of
 today's per-message dispatch, with no change to either mode's criterion:
@@ -182,17 +182,15 @@ This joins the list of things in `CLAUDE.md` that must be kept in sync when a no
 setting is added.
 
 `LibrusNotifier` is bound to one `LibrusUser` (it owns the SMTP credentials, the S3 config
-and the DB session), so each destination group picks a **representative** — the first member
-**in config order**.
+and the DB session), so each destination group picks a **representative**: its **first member
+in config order**. Because D11 removes the random user order, that is simply the order phase 1
+already produced, so no index or sort is needed — `UserCollection`s arrive in config order and
+bucketing preserves it.
 
-This needs carrying explicitly, and is easy to get wrong. `main()` shuffles a *copy* of the
-user list (`librus_users.copy()`, `pylibrus.py:1294`) deliberately, so that Librus is not
-always hit in the same order (`4754f06`). Phase 1 therefore produces `UserCollection`s in
-*shuffled* order, and grouping over that order would pick a different representative — hence a
-different sending SMTP account, a different S3 config and a different name order in the label
-— on every run. So `UserCollection` carries a `config_index` (its position in the unshuffled
-`librus_users`), and phase 2 sorts by it before bucketing. The shuffle keeps affecting only
-the scrape order, which is all it was ever for.
+Worth recording why this matters, since it was nearly a latent bug: the representative decides
+which SMTP account sends, which S3 config is used, and the order names appear in the label. Had
+the shuffle stayed, all three would have varied from run to run unless phase 2 explicitly
+re-sorted by each user's position in the unshuffled list.
 
 Two deliberate simplifications:
 - S3 settings are **not** part of the destination key. Two users on the same webhook with
@@ -246,6 +244,29 @@ delivers chronologically instead of interleaving per-user scrape order. Today's 
 ordering (`msgs.reverse()`, `pylibrus.py:795`; `reversed(announcements)`,
 `pylibrus.py:1221`) is oldest-first, so this preserves the existing intent.
 
+### D11 — Process users in config order; revert the random shuffle
+
+`4754f06` ("Process users in a random order") replaced
+
+```python
+for i, librus_user in enumerate(librus_users):
+```
+
+with a shuffled copy consumed via `pop(0)`. This change reverts it, restoring the plain
+`enumerate` loop.
+
+The motivation is simplification, and it lands squarely on this change: with the shuffle gone,
+"config order" and "the order phase 1 produced" are the same thing, so D6's representative
+selection needs no `config_index` field, no sort, and no explanation of why the two orders
+differ. One removed loop rewrite deletes a whole class of ordering bug from the new code.
+
+It also no longer buys what it used to. The plausible reason to randomise was that a run dying
+partway through would otherwise always starve the *same* user; under D8 a failing user is
+caught per-user and the rest are still collected and notified, so that concern is now handled
+directly rather than statistically. See §5.6 for what the revert does still cost.
+
+Note `random` stays imported — `_gen_x_baner()` (`pylibrus.py:593`) uses `random.random()`.
+
 ---
 
 ## 3. Implementation steps
@@ -275,7 +296,6 @@ class CollectedItem:
 class UserCollection:
     librus_user: LibrusUser
     notifier: LibrusNotifier
-    config_index: int                # position in the unshuffled librus_users list, see D6
     items: list[CollectedItem]
 ```
 
@@ -297,39 +317,34 @@ Phase 2 is then testable without any fake at all, since `notify_collected()` con
 
 `notify_collected(pylibrus_config, collections, dry_run=False)`:
 
-1. sort `collections` by `config_index` (D6), then bucket by
-   `librus_user.notify.destination_key()`;
+1. bucket `collections` by `librus_user.notify.destination_key()`; insertion order is already
+   config order (D6/D11), and `dict` preserves it, so no sort is needed;
 2. within each bucket, bucket `CollectedItem`s by `item.url`;
 3. sort groups by `item.date` (D10);
 4. apply the D4 send rule; on send, use the representative's notifier (the group's first
-   member, now genuinely in config order) with `display_name=", ".join(names)`, then set
+   member, i.e. first in config order) with `display_name=", ".join(names)`, then set
    `email_sent` on every member and `commit()` each affected session (D7);
 5. warn when members of one webhook group disagree on `webhook_attachments_source` (D6).
 
-### Step 5 — Rewire `main()` (`pylibrus.py:1281`)
+### Step 5 — Rewire `main()` (`pylibrus.py:1281`), reverting the shuffle (D11)
+
+Drop `users_to_handle = librus_users.copy()` / `random.shuffle(...)` / the `pop(0)` loop
+(`pylibrus.py:1294`–`1300`) and restore the `enumerate` loop `4754f06` replaced:
 
 ```python
-config_index = {user.name: i for i, user in enumerate(librus_users)}   # unshuffled, D6
-
 with contextlib.ExitStack() as stack:
     collections = []
-    for librus_user in users_to_handle:          # still shuffled: scrape order only
+    for i, librus_user in enumerate(librus_users):        # config order, D11
         try:
             notifier = stack.enter_context(LibrusNotifier(pylibrus_config, librus_user))
             with LibrusScraper(...) as scraper:
-                collections.append(collect_user(
-                    pylibrus_config, librus_user, scraper, notifier,
-                    config_index=config_index[librus_user.name],
-                ))
+                collections.append(collect_user(pylibrus_config, librus_user, scraper, notifier))
         except Exception:
             logger.exception(f"Failed to collect for {librus_user.name}")   # D8
-        if more users remain:
+        if i != len(librus_users) - 1:
             time.sleep(pylibrus_config.sleep_between_librus_users)
     notify_collected(pylibrus_config, collections, dry_run=args.dry)
 ```
-
-`config_index` is keyed on `name`, which is the `[user:<Name>]` section name and therefore
-already unique per config.
 
 Keep `handle_user()` as a thin single-user wrapper (`collect_user` + `notify_collected` on a
 one-element list) so the existing entry point and its semantics survive.
@@ -371,9 +386,9 @@ convention from `tests/test_handle_announcements.py`:
     messages, then both notified — must complete without `sqlite3.OperationalError: database
     is locked`. Use a real file in `tmp_path`, as `tests/test_handle_announcements.py`
     already does; a per-test or in-memory DB would not reproduce the lock.
-13. **Representative determinism (D6):** with the user list passed in shuffled order, the
-    chosen representative, the SMTP account used and the name order in the label are all
-    identical across runs and follow config order, not scrape order.
+13. **Representative determinism (D6/D11):** the chosen representative, the SMTP account used
+    and the name order in the label all follow config order and are stable across repeated
+    runs over the same config.
 
 Plus `uv run ruff check .` / `uv run ruff format .`, and a manual `--dry` run against the
 live config to confirm the grouping the logs report matches expectations before a real send.
@@ -423,15 +438,26 @@ finding `email_sent` written but never read in `unread` mode should leave it alo
 See D7. The explicit `commit()` after each phase is what keeps SQLite from locking; a future
 change that adds DB writes inside the collect phase must not leave a transaction open.
 
+### 5.6 Losing the shuffle concentrates the cost of a hard failure
+
+D11 means the users are always visited in config order. D8 covers a per-user *exception*, but
+not the process being killed outright — a cron or container timeout part-way through a run with
+several children and a 180 s sleep between them. With the shuffle, which child lost out varied;
+now it is consistently whoever is last in the config. Accepted as the price of the
+simplification; the visible symptom would be one child's notifications arriving late rather
+than not at all, since the next tick starts over.
+
 ---
 
 ## 6. Suggested commit sequence
 
-1. `refactor: add destination_key() and display_name to the notification path` (Steps 1–2,
+1. `revert: process Librus users in config order again` (D11 / the `main()` half of Step 5,
+   reverting `4754f06`). First, so the later commits never have to reason about two orders.
+2. `refactor: add destination_key() and display_name to the notification path` (Steps 1–2,
    no behaviour change, `display_name` unused).
-2. `refactor: split handle_user() into collect and notify phases` (Steps 3–5, single-user
+3. `refactor: split handle_user() into collect and notify phases` (Steps 3–5, single-user
    behaviour identical).
-3. `feat: label notifications with every child a message was sent to` (D4 grouping; both
+4. `feat: label notifications with every child a message was sent to` (D4 grouping; both
    modes' send criteria unchanged from today).
-4. `test: cover multi-recipient grouping and destination fan-out` (Step 4 / §4).
-5. `docs: describe the two-phase run and destination grouping` (Step 6).
+5. `test: cover multi-recipient grouping and destination fan-out` (Step 4 / §4).
+6. `docs: describe the two-phase run and destination grouping` (Step 6).
