@@ -56,6 +56,15 @@ librus_pass=
 ;db_name=
 ; optional, overrides the global fetch_announcements setting for this child only
 ;fetch_announcements=true
+; optional, default true. Whether this child is ALWAYS named in the notification label,
+; or only when no other child's name would appear there:
+;   true  - always named
+;   false - left out of the label whenever at least one other child received the same
+;           message, but still named when nothing else would name it
+; Useful for an account whose name adds nothing to the label, e.g. a second parent login
+; onto the same child. Only has an effect when a message reached several children, and it
+; never affects delivery or deduplication - the message is still forwarded once.
+;always_include_in_subject=true
 smtp_user=
 smtp_pass=
 smtp_server=
