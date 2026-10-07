@@ -1,4 +1,4 @@
-# Plan: hiding selected children's names from grouped notification labels
+# Plan: omitting redundant children's names from grouped notification labels
 
 Status: proposal / design document. Nothing in this document is implemented yet. Extends the
 feature designed in [`MULTI_RECIPIENT_PLAN.md`](MULTI_RECIPIENT_PLAN.md), whose decisions
@@ -26,7 +26,7 @@ config entry mark such an account as **not worth naming**, so the label above be
 
 while the message is still deduplicated exactly as now — one copy, not two.
 
-### 1.1 Suggested name for the config entry: `include_name_in_subject`
+### 1.1 Name of the config entry: `always_include_in_subject`
 
 Per-user, in the `[user:<Name>]` section, boolean, **default `true`**:
 
@@ -34,25 +34,36 @@ Per-user, in the `[user:<Name>]` section, boolean, **default `true`**:
 [user:Jaś]
 librus_user=
 librus_pass=
-; Whether this child's name appears in the notification label when a message was
-; received by several children. Delivery and deduplication are unaffected.
-include_name_in_subject=false
+; Whether this child is ALWAYS named in the notification label, or only when no other
+; child's name would appear there.
+;   true  (default) - always named
+;   false           - left out of the label whenever at least one other child received
+;                     the same message, but still named when nothing else would name it
+; So this only has an effect when a message reached several children. Delivery and
+; deduplication are never affected by this setting.
+always_include_in_subject=false
 ```
 
-Why this name:
+**Why `always_`:** it states the rule exactly. D2 does not drop a name unconditionally — it
+drops it only while another name remains, so a message that reached *only* this child is still
+labelled with them. "Always include = false" is precisely that: not always, but not never
+either. The word also tells the reader the setting chooses between cases, which is what points
+them at the deduplicating case where it applies.
+
+Also:
 - **Positive sense, default true**, matching the file's existing booleans (`fetch_attachments`,
-  `fetch_announcements`). Omitting it leaves every existing config behaving identically, and
-  `include_name_in_subject=false` reads without a double negative.
+  `fetch_announcements`), so omitting it leaves every existing config behaving identically.
 - **"subject" is the word a reader will look for**, and the one used when this was requested.
 
 Alternatives considered:
 
 | Candidate | Why not |
 |---|---|
-| `include_in_subject` | Shorter and reads fine (`include_in_subject=false`), but leaves *what* is included implicit. Acceptable second choice. |
+| `include_name_in_subject` | The first proposal, rejected as inaccurate: it promises the name is absent from the subject, which under D2 is untrue whenever that child is the only one left to name. `always_` is the honest form of the same idea. |
+| `include_in_subject` | Shorter, but claims the same untruth, and leaves *what* is included implicit. |
 | `include_in_recipient_names` | Channel-neutral, but clunky, and "recipient" already means the email's `email_dest` elsewhere in the config. |
 | `skip_name_in_subject` | Negative sense; `skip_name_in_subject=false` is a double negative and breaks the file's positive-default style. |
-| `hide_name` / `anonymous` | Sound broader than they are — as if the name were hidden from the body or the logs too. |
+| `hide_name` / `anonymous` | Sound broader than they are — as if the name were hidden from the body or the logs too — and claim the same untruth. |
 
 One wart to accept: the label also appears in the **webhook** header, which has no "subject"
 (see D4). The key governs both; the config comment says so.
@@ -65,42 +76,43 @@ One wart to accept: the label also appears in the **webhook** header, which has 
 
 The setting must not affect `Notify.destination_key()`, how items are grouped,
 `should_notify_group()`, `CollectedItem.email_sent`, or which destinations receive a copy. A
-hidden child is a full participant in collection and deduplication; only their *name* is left
-out of the text.
+child left out of the label is still a full participant in collection and deduplication; only
+their *name* is left out of the text.
 
-This is the whole point, and it is easy to get wrong in a way that looks like a feature: if a
-hidden child were instead excluded from the group, they would stop deduplicating against their
+This is the whole point, and it is easy to get wrong in a way that looks like a feature: if such
+a child were instead excluded from the group, they would stop deduplicating against their
 siblings and start receiving a *second, separate* copy of every shared message — the exact
 problem `MULTI_RECIPIENT_PLAN.md` exists to solve.
 
-### D2 — A name is hidden only while another name remains
+### D2 — A name is omitted only while another name remains
 
-`display_name` is built from the children of the group whose `include_name_in_subject` is true.
-If that leaves **nothing**, the label falls back to the full recipient list (D3).
+`display_name` is built from the children of the group whose `always_include_in_subject` is
+true. If that leaves **nothing**, the label falls back to the full recipient list (D3).
 
-So a message that reached only hidden children still says whose it is. The alternative —
+So a message that reached only such children still says whose it is. The alternative —
 *always* hide, yielding `[LIBRUS] Zebranie` with no name at all — was rejected: in a
-three-child setup where only Jaś is hidden, a message that reached Jaś alone would arrive with
-no indication which child it concerned. Hiding is about removing redundancy from a list, not
-about anonymising.
+three-child setup where only Jaś is unnamed, a message that reached Jaś alone would arrive with
+no indication which child it concerned. This is about removing redundancy from a list, not
+about anonymising an account.
 
-**Open question.** This is the one genuinely debatable decision here. If the intent is closer
-to "this account must never be named anywhere", say so and D2/D3 become "always omit, and the
-label degrades to `[LIBRUS]`".
+**Resolved.** This was the one debatable decision, and it is settled: the feature is about
+**redundancy**, not about never naming an account. The "always omit, label degrades to
+`[LIBRUS]`" reading is explicitly not what is wanted, which is also why the config entry is
+named `always_include_in_subject` rather than something that promises absence (see §1.1).
 
-### D3 — When every name in a group is hidden, fall back to the full list
+### D3 — When no name in a group is always-included, fall back to the full list
 
 Options, with the recommendation first:
 
 1. **Full recipient list.** Predictable, never nameless, and the degenerate config is reported
-   separately (below). A group of two hidden children is labelled `Ania, Jaś`.
+   separately (below). A group of two such children is labelled `Ania, Jaś`.
 2. *Representative only* — never nameless and never shows the full suppressed list, but which
    single name appears is an arbitrary consequence of config order.
-3. *Nameless* (`[LIBRUS] Zebranie`) — self-consistent if every user is hidden, but see D2 for
+3. *Nameless* (`[LIBRUS] Zebranie`) — self-consistent if no user is always-included, but see D2 for
    why it is wrong when only some are.
 
 Separately, `read_pylibrus_config()` logs a warning at startup if **every** configured user has
-`include_name_in_subject=false`, since the setting then changes nothing and almost certainly
+`always_include_in_subject=false`, since the setting then changes nothing and almost certainly
 means the config was misunderstood.
 
 ### D4 — The webhook header follows the subject
@@ -130,7 +142,7 @@ the two differ, log both, e.g.
 ### D6 — The representative is unchanged
 
 The group's representative (first in config order) decides which SMTP account sends, which S3
-config is used, and the order names appear in. A hidden child stays eligible, keeping this
+config is used, and the order names appear in. An unnamed child stays eligible, keeping this
 setting purely cosmetic.
 
 Preferring a *visible* child as representative was considered and rejected: it would let a
@@ -141,10 +153,10 @@ cosmetic flag change which account sends mail, re-opening the determinism questi
 
 Unlike `fetch_announcements`, a global default is meaningless: the entry identifies *which*
 account to leave unnamed, and a global `false` would hide every name (the degenerate case in
-D3). So there is no `[global] include_name_in_subject`.
+D3). So there is no `[global] always_include_in_subject`.
 
 `LibrusUser.from_env()` must still gain it, per the `CLAUDE.md` rule that
-`from_config()`/`from_env()` stay in sync — as `INCLUDE_NAME_IN_SUBJECT`. Note it is inert
+`from_config()`/`from_env()` stay in sync — as `ALWAYS_INCLUDE_IN_SUBJECT`. Note it is inert
 there: env mode supports a single user, who is therefore always the only recipient, so under D2
 their name always shows.
 
@@ -154,12 +166,12 @@ their name always shows.
 
 ### Step 1 — Config plumbing (`LibrusUser`, `pylibrus.py:254`)
 
-- New field: `include_name_in_subject: bool = True`.
-- `from_config()` (`pylibrus.py:263`): `config[section].getboolean("include_name_in_subject", fallback=True)`.
+- New field: `always_include_in_subject: bool = True`.
+- `from_config()` (`pylibrus.py:263`): `config[section].getboolean("always_include_in_subject", fallback=True)`.
   Note this differs from the `fetch_announcements` line just above it (`pylibrus.py:277`), which
   uses `fallback=None` because `None` there means "fall back to the global setting"; there is no
   global here (D7), so the fallback is the real default.
-- `from_env()` (`pylibrus.py:288`): `INCLUDE_NAME_IN_SUBJECT`.
+- `from_env()` (`pylibrus.py:288`): `ALWAYS_INCLUDE_IN_SUBJECT`.
 
   **Gotcha:** `LibrusUser` is a `slots=True` dataclass with **no `__post_init__`**, unlike
   `PyLibrusConfig`, which normalises `None` back to each field's default. So `from_env()` must
@@ -181,13 +193,13 @@ with a small helper, so the rule is unit-testable on its own:
 def group_names(group: ItemGroup) -> tuple[str, str]:
     """Returns (display_name, recipient_names): what the reader sees, and the whole truth.
 
-    A child configured with include_name_in_subject=false is left out of display_name, but
-    only while another child remains to name - a message that reached only hidden children is
+    A child configured with always_include_in_subject=false is left out of display_name, but
+    only while another child remains to name - a message that reached only such children is
     still labelled with them rather than with nothing. See SUBJECT_NAMES_PLAN.md D2/D3.
     """
     users = [collection.librus_user for collection, _ in group]
     recipient_names = ", ".join(user.name for user in users)
-    visible = [user.name for user in users if user.include_name_in_subject]
+    visible = [user.name for user in users if user.always_include_in_subject]
     return (", ".join(visible) if visible else recipient_names), recipient_names
 ```
 
@@ -196,23 +208,24 @@ lines (D5), appending `(received by: …)` only when the two differ.
 
 ### Step 3 — Startup warning (`read_pylibrus_config`, `pylibrus.py:1154`)
 
-Warn when `librus_users` is non-empty and no user has `include_name_in_subject` true (D3).
+Warn when `librus_users` is non-empty and no user has `always_include_in_subject` true (D3).
 
 ### Step 4 — Tests (`tests/test_multi_recipient.py`)
 
-The existing `make_user()` helper gains an `include_name_in_subject=True` argument. New cases:
+The existing `make_user()` helper gains an `always_include_in_subject=True` argument. New cases:
 
-1. Hidden child in a two-child group → label is `"Ania"`, not `"Ania, Jaś"`.
-2. **Still one copy, not two** — the hidden child dedupes exactly as before (D1).
-3. Item that reached only the hidden child → label is `"Jaś"` (D2).
-4. Every child in the group hidden → label is the full list (D3).
-5. Hidden flag does not change destination grouping: two destinations still both notified (D1).
+1. `always_include_in_subject=false` child in a two-child group → label is `"Ania"`, not
+   `"Ania, Jaś"`.
+2. **Still one copy, not two** — that child dedupes exactly as before (D1).
+3. Item that reached only that child → label is `"Jaś"` (D2).
+4. No child in the group always-included → label is the full list (D3).
+5. The flag does not change destination grouping: two destinations still both notified (D1).
 6. The webhook header is filtered too (D4).
 7. Logs / `--dry` report the full recipient list even when the label is filtered (D5) — assert
    on `caplog`.
-8. A hidden child that is the representative still sends through its own account (D6).
+8. Such a child, when it is the representative, still sends through its own account (D6).
 9. `from_config()` defaults to true when the key is absent, and parses `false`.
-10. `from_env()` defaults to true when `INCLUDE_NAME_IN_SUBJECT` is unset (the Step 1 gotcha).
+10. `from_env()` defaults to true when `ALWAYS_INCLUDE_IN_SUBJECT` is unset (the Step 1 gotcha).
 
 Each should be mutation-checked the way the existing suite was: confirm the test fails when the
 filter is removed, when the D3 fallback is dropped, and when the logs are switched to the
@@ -229,13 +242,14 @@ filtered label.
 
 ## 4. Risks
 
-- **Mistaken for a delivery switch.** Someone reading `include_name_in_subject=false` could
-  reasonably expect the child to stop receiving notifications. Mitigated only by wording: the
+- **Mistaken for a delivery switch.** Someone reading `always_include_in_subject=false` could
+  expect the child to stop receiving notifications. Less likely than with the rejected
+  `hide_name`, since the key names the subject explicitly, but still mitigated by wording: the
   ini comment, README and docstring all state that delivery and dedupe are unaffected.
 - **Silent `None` from `from_env()`.** See the Step 1 gotcha; covered by test 10.
 - **The setting is invisible in its common case.** With one child per destination the label has
   a single name anyway, so setting the flag appears to do nothing. The startup warning (Step 3)
-  catches only the all-hidden case, not this one.
+  catches only the case where no user is always-included, not this one.
 
 ---
 
@@ -243,4 +257,4 @@ filtered label.
 
 1. `feat: allow hiding a child's name from grouped notification labels` (Steps 1–3).
 2. `test: cover name visibility in grouped notifications` (Step 4).
-3. `docs: document include_name_in_subject` (Step 5).
+3. `docs: document always_include_in_subject` (Step 5).
