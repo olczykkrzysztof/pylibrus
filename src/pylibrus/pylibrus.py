@@ -258,6 +258,10 @@ class LibrusUser:
     notify: EmailNotify | WebhookNotify
     db_name: str
     fetch_announcements: bool | None = None  # None means: fall back to the global setting
+    # False leaves this child out of a grouped notification's label whenever another child
+    # received the same message - but never when nothing else would name it. Labelling only:
+    # it does not affect delivery or dedupe. See SUBJECT_NAMES_PLAN.md.
+    always_include_in_subject: bool = True
 
     @classmethod
     def from_config(cls, config, section) -> "LibrusUser":
@@ -275,6 +279,9 @@ class LibrusUser:
         if not db_name:
             db_name = config["global"].get("db_name", "pylibrus.sqlite")
         fetch_announcements = config[section].getboolean("fetch_announcements", fallback=None)
+        # Unlike fetch_announcements above, there is no global counterpart to fall back to
+        # (the entry names *which* child to leave out), so the fallback is the real default.
+        always_include_in_subject = config[section].getboolean("always_include_in_subject", fallback=True)
         return cls(
             name=name,
             login=librus_user,
@@ -282,10 +289,15 @@ class LibrusUser:
             notify=notify,
             db_name=db_name,
             fetch_announcements=fetch_announcements,
+            always_include_in_subject=always_include_in_subject,
         )
 
     @classmethod
     def from_env(cls) -> "LibrusUser":
+        # LibrusUser has no __post_init__ normalising None back to each field's default (unlike
+        # PyLibrusConfig), so an unset variable must not reach a defaulted bool field as None:
+        # None is falsy and would quietly stop naming the single configured user.
+        always_include_in_subject = str_to_bool(os.environ.get("ALWAYS_INCLUDE_IN_SUBJECT"))
         return cls(
             login=os.environ.get("LIBRUS_USER"),
             password=os.environ.get("LIBRUS_PASS"),
@@ -293,6 +305,7 @@ class LibrusUser:
             notify=WebhookNotify.from_env() if str_to_bool(os.environ.get("WEBHOOK")) else EmailNotify.from_env(),
             db_name=os.environ.get("DB_NAME"),
             fetch_announcements=str_to_bool(os.environ.get("FETCH_ANNOUNCEMENTS")),
+            always_include_in_subject=True if always_include_in_subject is None else always_include_in_subject,
         )
 
     @classmethod
@@ -1159,11 +1172,15 @@ def read_pylibrus_config(workdir: str, config_file: str) -> tuple[PyLibrusConfig
         config.read(config_path)
         pylibrus_config = PyLibrusConfig.from_config(workdir, config)
         librus_users = LibrusUser.load_librus_users_from_config(config)
-        return pylibrus_config, librus_users
     else:
         logger.info(f"Could not find config file: {config_path}, read config from env variables")
         pylibrus_config = PyLibrusConfig.from_env(workdir)
         librus_users = [LibrusUser.from_env()]
+    if librus_users and not any(user.always_include_in_subject for user in librus_users):
+        logger.warning(
+            "No configured user has always_include_in_subject enabled, so every grouped "
+            "notification falls back to naming all of its children - the setting has no effect",
+        )
     return pylibrus_config, librus_users
 
 
@@ -1356,22 +1373,40 @@ def should_notify_group(pylibrus_config: PyLibrusConfig, group: ItemGroup) -> tu
     return True, ""
 
 
+def group_names(group: ItemGroup) -> tuple[str, str]:
+    """Returns (display_name, recipient_names): what the reader sees, and the whole truth.
+
+    A child configured with `always_include_in_subject=false` is left out of `display_name`,
+    but only while another child remains to name - an item that reached only such children is
+    still labelled with them rather than with nothing at all. See SUBJECT_NAMES_PLAN.md.
+    """
+    users = [collection.librus_user for collection, _ in group]
+    recipient_names = ", ".join(user.name for user in users)
+    always_named = [user.name for user in users if user.always_include_in_subject]
+    return (", ".join(always_named) if always_named else recipient_names), recipient_names
+
+
 def notify_group(
     pylibrus_config: PyLibrusConfig, group: ItemGroup, should_notify: bool, reason: str, dry_run: bool = False,
 ):
     representative, first = group[0]
     item = first.item
-    display_name = ", ".join(collection.librus_user.name for collection, _ in group)
+    display_name, recipient_names = group_names(group)
+    # Logs name every child that received the item even when the notification itself leaves
+    # some of them out, so that --dry and the skip lines never under-report who it reached.
+    logged_for = display_name
+    if display_name != recipient_names:
+        logged_for = f"{display_name} (received by: {recipient_names})"
 
     if dry_run:
         # Do not notify and do not touch email_sent, so a regular (non-dry) run afterwards
         # still sends this item normally.
         verdict = "would send" if should_notify else f"would skip ({reason})"
-        logger.info(f"[DRY RUN] '{item.subject}' for {display_name}: {verdict}")
+        logger.info(f"[DRY RUN] '{item.subject}' for {logged_for}: {verdict}")
         return
 
     if not should_notify:
-        logger.info(f"Do not send '{item.subject}' for {display_name} ({reason})")
+        logger.info(f"Do not send '{item.subject}' for {logged_for} ({reason})")
         return
 
     warn_on_mixed_attachments_source(group)
