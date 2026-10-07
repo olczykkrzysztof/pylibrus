@@ -8,11 +8,16 @@ real SQLite files in tmp_path so the cross-session behaviour (and the shared-fil
 two-phase split introduced) is exercised for real.
 """
 
+import configparser
 import contextlib
 import datetime
+import email
+import logging
+from email.header import decode_header, make_header
 
 import pytest
 
+import pylibrus.pylibrus as P
 from pylibrus.pylibrus import (
     EmailNotify,
     LibrusNotifier,
@@ -20,6 +25,7 @@ from pylibrus.pylibrus import (
     WebhookNotify,
     collect_user,
     notify_collected,
+    read_pylibrus_config,
 )
 
 NOW = datetime.datetime.now()
@@ -71,7 +77,7 @@ def email_to(dest) -> EmailNotify:
     return EmailNotify(smtp_user="u", smtp_pass="p", smtp_server="s", email_dest=dest)
 
 
-def make_user(name, notify, db_name="shared.sqlite") -> LibrusUser:
+def make_user(name, notify, db_name="shared.sqlite", always_include_in_subject=True) -> LibrusUser:
     return LibrusUser(
         login=f"login-{name}",
         password="pass",
@@ -79,6 +85,7 @@ def make_user(name, notify, db_name="shared.sqlite") -> LibrusUser:
         notify=notify,
         db_name=db_name,
         fetch_announcements=False,
+        always_include_in_subject=always_include_in_subject,
     )
 
 
@@ -334,3 +341,266 @@ def test_a_child_whose_scrape_fails_does_not_block_the_others(config, notifier_f
         notify_collected(config, collections)
 
     assert labels(send_log) == ["Jas"]
+
+
+# --- always_include_in_subject: leaving a redundant child out of the label -----------------
+#
+# The entry is labelling only. It never changes delivery or dedupe, and it never leaves an
+# item with no name at all - see SUBJECT_NAMES_PLAN.md.
+
+
+def test_redundant_child_is_left_out_of_the_label(config, notifier_factory, send_log):
+    dest = email_to("parents@example.com")
+    users = [
+        make_user("Ania", dest),
+        make_user("Jas", dest, always_include_in_subject=False),
+    ]
+
+    run(config, notifier_factory, [(u, FakeScraper([("/wiadomosci/5/2001", False)])) for u in users])
+
+    assert labels(send_log) == ["Ania"]
+
+
+def test_omitting_a_name_does_not_resume_duplicate_delivery(config, notifier_factory, send_log):
+    """The regression this entry must never cause: still one copy, not one per child."""
+    dest = email_to("parents@example.com")
+    users = [
+        make_user("Ania", dest),
+        make_user("Jas", dest, always_include_in_subject=False),
+    ]
+
+    run(config, notifier_factory, [(u, FakeScraper([("/wiadomosci/5/2002", False)])) for u in users])
+
+    assert len(send_log) == 1
+
+
+def test_item_that_reached_only_that_child_is_still_labelled_with_them(config, notifier_factory, send_log):
+    """A name is dropped only while another name remains, never leaving the label empty."""
+    dest = email_to("parents@example.com")
+    users_and_scrapers = [
+        (make_user("Ania", dest), FakeScraper([])),
+        (make_user("Jas", dest, always_include_in_subject=False), FakeScraper([("/wiadomosci/5/2003", False)])),
+    ]
+
+    run(config, notifier_factory, users_and_scrapers)
+
+    assert labels(send_log) == ["Jas"]
+
+
+def test_group_with_no_always_included_child_falls_back_to_the_full_list(config, notifier_factory, send_log):
+    dest = email_to("parents@example.com")
+    users = [
+        make_user("Ania", dest, always_include_in_subject=False),
+        make_user("Jas", dest, always_include_in_subject=False),
+    ]
+
+    run(config, notifier_factory, [(u, FakeScraper([("/wiadomosci/5/2004", False)])) for u in users])
+
+    assert labels(send_log) == ["Ania, Jas"]
+
+
+def test_omitting_a_name_does_not_change_destination_grouping(config, notifier_factory, send_log):
+    users = [
+        make_user("Ania", email_to("ania-parents@example.com")),
+        make_user(
+            "Jas",
+            WebhookNotify(webhook="https://hooks.example.com/jas"),
+            always_include_in_subject=False,
+        ),
+    ]
+
+    run(config, notifier_factory, [(u, FakeScraper([("/wiadomosci/5/2005", False)])) for u in users])
+
+    # Both destinations are still notified; each names only its own children, and Jas is the
+    # only child of its destination so it is still named there.
+    assert sorted(labels(send_log)) == ["Ania", "Jas"]
+
+
+def test_a_child_left_out_of_the_label_can_still_be_the_representative(config, notifier_factory, send_log):
+    """The entry is cosmetic: it must not move which account does the sending."""
+    dest = email_to("parents@example.com")
+    users = [
+        make_user("Jas", dest, always_include_in_subject=False),  # first in config order
+        make_user("Ania", dest),
+    ]
+
+    run(config, notifier_factory, [(u, FakeScraper([("/wiadomosci/5/2006", False)])) for u in users])
+
+    assert send_log == [("Jas", "Temat /wiadomosci/5/2006", "Ania")]
+
+
+def test_logs_name_every_child_even_when_the_label_does_not(config, notifier_factory, send_log, caplog):
+    dest = email_to("parents@example.com")
+    users = [
+        make_user("Ania", dest),
+        make_user("Jas", dest, always_include_in_subject=False),
+    ]
+
+    with caplog.at_level(logging.INFO):
+        run(
+            config,
+            notifier_factory,
+            [(u, FakeScraper([("/wiadomosci/5/2007", False)])) for u in users],
+            dry_run=True,
+        )
+
+    assert send_log == []
+    dry_lines = [r.message for r in caplog.records if "[DRY RUN]" in r.message]
+    assert len(dry_lines) == 1
+    assert "for Ania (received by: Ania, Jas)" in dry_lines[0]
+
+
+def test_logs_do_not_repeat_themselves_when_every_child_is_named(config, notifier_factory, send_log, caplog):
+    dest = email_to("parents@example.com")
+    users = [make_user("Ania", dest), make_user("Jas", dest)]
+
+    with caplog.at_level(logging.INFO):
+        run(
+            config,
+            notifier_factory,
+            [(u, FakeScraper([("/wiadomosci/5/2008", False)])) for u in users],
+            dry_run=True,
+        )
+
+    dry_lines = [r.message for r in caplog.records if "[DRY RUN]" in r.message]
+    assert "for Ania, Jas:" in dry_lines[0]
+    assert "received by" not in dry_lines[0]
+
+
+def test_webhook_header_leaves_the_redundant_name_out_too(config, monkeypatch):
+    """One display_name feeds both the email subject and the webhook header."""
+    posted = {}
+
+    class FakeResponse:
+        status_code = 200
+
+    def fake_post(url, data=None, headers=None):
+        posted["data"] = data
+        return FakeResponse()
+
+    monkeypatch.setattr(P.requests, "post", fake_post)
+
+    webhook = WebhookNotify(webhook="https://hooks.example.com/parents")
+    users = [
+        make_user("Ania", webhook),
+        make_user("Jas", webhook, always_include_in_subject=False),
+    ]
+
+    run(config, LibrusNotifier, [(u, FakeScraper([("/wiadomosci/5/2009", False)])) for u in users])
+
+    assert "*LIBRUS Ania - " in posted["data"]
+    assert "Jas" not in posted["data"]
+
+
+def test_email_subject_leaves_the_redundant_name_out_too(config, monkeypatch):
+    sent = {}
+
+    class FakeSMTP:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def ehlo(self):
+            pass
+
+        def starttls(self):
+            pass
+
+        def login(self, *args):
+            pass
+
+        def sendmail(self, from_addr, to_addrs, body):
+            sent["body"] = body
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(P.smtplib, "SMTP", FakeSMTP)
+
+    dest = email_to("parents@example.com")
+    users = [
+        make_user("Ania", dest),
+        make_user("Jas", dest, always_include_in_subject=False),
+    ]
+
+    run(config, LibrusNotifier, [(u, FakeScraper([("/wiadomosci/5/2010", False)])) for u in users])
+
+    subject = str(make_header(decode_header(email.message_from_string(sent["body"])["Subject"])))
+    assert subject == "[LIBRUS Ania] Temat /wiadomosci/5/2010"
+
+
+# --- always_include_in_subject: config parsing ---------------------------------------------
+
+
+def _config_parser(section_body: str) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser()
+    parser.read_string(
+        "[global]\ndb_name=shared.sqlite\n\n[user:Jas]\nlibrus_user=l\nlibrus_pass=p\n"
+        "email_dest=d@example.com\nsmtp_user=u\nsmtp_pass=p\nsmtp_server=s\nsmtp_port=587\n"
+        + section_body,
+    )
+    return parser
+
+
+def test_from_config_defaults_to_always_including_the_name():
+    user = LibrusUser.from_config(_config_parser(""), "user:Jas")
+
+    assert user.always_include_in_subject is True
+
+
+def test_from_config_parses_the_entry():
+    user = LibrusUser.from_config(_config_parser("always_include_in_subject=false\n"), "user:Jas")
+
+    assert user.always_include_in_subject is False
+
+
+def test_from_env_defaults_to_always_including_the_name(monkeypatch):
+    """An unset variable must not land on the field as None - None is falsy."""
+    for var in ("ALWAYS_INCLUDE_IN_SUBJECT", "WEBHOOK"):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in (
+        ("LIBRUS_USER", "l"),
+        ("LIBRUS_PASS", "p"),
+        ("LIBRUS_NAME", "Jas"),
+        ("DB_NAME", "shared.sqlite"),
+        ("SMTP_USER", "u"),
+        ("SMTP_PASS", "p"),
+        ("SMTP_SERVER", "s"),
+        ("SMTP_PORT", "587"),
+        ("EMAIL_DEST", "d@example.com"),
+    ):
+        monkeypatch.setenv(var, value)
+
+    assert LibrusUser.from_env().always_include_in_subject is True
+
+
+def test_from_env_parses_the_entry(monkeypatch):
+    monkeypatch.setenv("ALWAYS_INCLUDE_IN_SUBJECT", "false")
+    monkeypatch.delenv("WEBHOOK", raising=False)
+    for var, value in (
+        ("LIBRUS_USER", "l"),
+        ("LIBRUS_PASS", "p"),
+        ("LIBRUS_NAME", "Jas"),
+        ("DB_NAME", "shared.sqlite"),
+        ("SMTP_USER", "u"),
+        ("SMTP_PASS", "p"),
+        ("SMTP_SERVER", "s"),
+        ("SMTP_PORT", "587"),
+        ("EMAIL_DEST", "d@example.com"),
+    ):
+        monkeypatch.setenv(var, value)
+
+    assert LibrusUser.from_env().always_include_in_subject is False
+
+
+def test_config_with_no_always_included_user_warns(tmp_path, caplog):
+    ini = tmp_path / "pylibrus.ini"
+    ini.write_text(
+        "[global]\ndb_name=shared.sqlite\n\n[user:Jas]\nlibrus_user=l\nlibrus_pass=p\n"
+        "email_dest=d@example.com\nsmtp_user=u\nsmtp_pass=p\nsmtp_server=s\nsmtp_port=587\n"
+        "always_include_in_subject=false\n",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        read_pylibrus_config(str(tmp_path), "pylibrus.ini")
+
+    assert any("has no effect" in r.message for r in caplog.records)
