@@ -76,6 +76,19 @@ Each destination is told only about the children configured to it: with two chil
 to one address and three to another, each address receives a single grouped notification naming
 its own children. Children on separate `db_name` files are grouped too.
 
+If one of the accounts adds nothing to that label - a second parent login onto the same child,
+a leftover account that still receives school-wide announcements - set
+`always_include_in_subject=false` for it. Its name is then left out whenever at least one other
+child received the same message:
+
+```
+[LIBRUS Ania] Zebranie z rodzicami
+```
+
+but it is still named when nothing else would name the message, so you never get a notification
+that doesn't say whose it is. The setting is about redundancy in that list and nothing else: the
+account still takes part in deduplication, so the message is still forwarded exactly once.
+
 One consequence of collecting every child before sending: notifications arrive only after all
 children have been scraped, so with several children and a large `sleep_between_librus_users`
 they land a few minutes later than they used to.

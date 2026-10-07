@@ -81,6 +81,13 @@ the same message. See `MULTI_RECIPIENT_PLAN.md` for the full rationale.
   `"unsent"` and announcements skip what `email_sent` marks; `"unread"` decides purely from the
   unread state scraped from Librus and deliberately **ignores** `email_sent`, so an unread item
   is re-sent every run until somebody opens it. Do not "fix" that into an `email_sent` check.
+- `group_names()` builds two strings: the label the reader sees and the full recipient list. A
+  user with `always_include_in_subject=false` (per-user config, default true) is left out of the
+  label, but *only* while another name remains — an item that reached only such children is
+  still labelled with them, and a group where nobody is always-included falls back to the full
+  list. The entry is labelling only; it must never reach `destination_key()`, the grouping, the
+  send rule or the representative. Logs always use the full recipient list, so `--dry` and the
+  skip lines never under-report. See `SUBJECT_NAMES_PLAN.md`.
 - `handle_user()` and `handle_announcements()` remain single-user wrappers; grouping across
   children needs `main()`'s loop.
 
