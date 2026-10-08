@@ -1,7 +1,85 @@
 # pyLibrus
 
-Message scraper from crappy Librus Synergia gradebook. Forwards every new
+Message scraper from Librus Synergia gradebook. Forwards every new
 message from a given folder to an e-mail, and (optionally) new announcements too.
+
+> [!WARNING]
+> **Disclaimer.** pyLibrus is an unofficial, community-made tool. It is not affiliated with,
+> endorsed by or supported by Librus or the Synergia gradebook. It is intended **for personal
+> and education use only**: on your individual single account.
+>
+> pyLibrus logs into Librus and scrapes its web pages automatically. **It is your
+> responsibility to check that using it complies with the Librus terms of service** (and any
+> rules set by your school) before you run it.
+> *Never* use it for bots, automated scrapping, monitoring or commercial purposes!
+>
+> The software is provided "as is", without warranty of any kind. 
+> The authors accept no liability for its use, including blocked
+> accounts, missed or duplicated notifications, or data sent to the wrong place.
+
+## What it does
+
+pyLibrus is a small command-line script meant to run unattended from cron every few minutes.
+On each run, for every configured Librus parent account ("user", usually one per child), it:
+
+1. **Logs into Librus Synergia** the way a browser does. Librus has no public API, so pyLibrus
+   follows the web login flow and parses the HTML pages. Session cookies are cached in
+   `pylibrus_cookies.json` and reused, so a full login only happens when the session has
+   expired.
+2. **Reads the inbox** ("Odebrane"), along with each message's read/unread state. Only the
+   first page of the inbox listing is read, which is plenty when running every few minutes.
+3. **Downloads each new message**: sender, subject, sent date, body (HTML and plain text) and
+   attachments. Messages older than `max_age_of_sending_msg_days` (default 4) are skipped, so
+   the first run doesn't flood you with the whole school year.
+4. **Stores everything in a local SQLite database** (`pylibrus.sqlite` by default) so that
+   nothing is downloaded or processed twice.
+5. **Forwards new items** by e-mail or to a webhook (see [Notifications](#notifications)).
+
+Optionally it also forwards [announcements](#announcements), and it merges
+[messages sent to several children](#messages-sent-to-several-children) into one
+notification.
+
+### Which messages are forwarded
+
+The `send_message` setting picks one of two modes:
+
+* `unread` (default): a message is forwarded while it is **unread in Librus**. pyLibrus never
+  marks messages as read itself, so an unread message is sent again on **every run** until
+  somebody opens it in Librus. Treat it as a reminder that won't stop until the message is
+  read. With several children, a message counts as read only once it is read in every
+  child's account.
+* `unsent`: each message is forwarded **exactly once**, whatever its state in Librus.
+
+## Notifications
+
+Each user is forwarded to one destination: e-mail or webhook. Several users can share the
+same destination.
+
+### E-mail
+
+Set `smtp_server`, `smtp_port` (default 587), `smtp_user`, `smtp_pass` and `email_dest`, which
+is a comma-separated list of recipients. pyLibrus connects with STARTTLS and logs in as
+`smtp_user`, which is also the sender address. A forwarded message looks like this:
+
+* **Subject:** `[LIBRUS <child name>] <original subject>`
+* **From:** `"<Librus sender> @ Librus" <smtp_user>`, so you can see at a glance which teacher
+  wrote it
+* **Body:** the original message in HTML and plain text, followed by the date it was sent in
+  Librus
+* **Attachments:** downloaded from Librus and attached to the e-mail. With
+  `fetch_attachments=false` the e-mail lists links to the attachments on Librus instead.
+  Those links only work in a browser that is logged into Librus.
+
+For Gmail, use an [app password](https://support.google.com/accounts/answer/185833) as
+`smtp_pass`.
+
+### Webhook
+
+Set `webhook` to a URL that accepts a Slack-style JSON payload (`{"text": "..."}`), such as a
+Slack incoming webhook or anything compatible. The text holds the child's name, date, sender,
+subject and plain-text body, plus links to the attachments. By default those links point to
+Librus. To get links that work without a Librus login, see
+[Webhook attachments in S3](#webhook-attachments-in-s3).
 
 ## Running
 
@@ -9,7 +87,60 @@ message from a given folder to an e-mail, and (optionally) new announcements too
 * Checkout **pylibrus** repository
 * Verify everything's installed correctly with `uv run src/pylibrus/pylibrus.py --help`
 * Setup `pylibrus.ini` according to [`pylibrus.ini.example`](pylibrus.ini.example)
+* Send a test notification with `uv run src/pylibrus/pylibrus.py --test-notify` (see below)
 * Run from cron every few minutes
+
+### Configuration
+
+The recommended setup is an INI file, `pylibrus.ini` in the working directory. It has a
+`[global]` section and one `[user:<Name>]` section per Librus account. `<Name>` is the name
+shown in notifications. Every key is documented in
+[`pylibrus.ini.example`](pylibrus.ini.example).
+
+If the INI file doesn't exist, pyLibrus reads its configuration from environment variables
+instead. This supports a **single user with e-mail notifications** only: `LIBRUS_USER`,
+`LIBRUS_PASS`, `LIBRUS_NAME`, `SMTP_USER`, `SMTP_PASS`, `SMTP_SERVER`, `SMTP_PORT` and
+`EMAIL_DEST`, plus optionally `SEND_MESSAGE`, `FETCH_ATTACHMENTS`,
+`MAX_AGE_OF_SENDING_MSG_DAYS`, `FETCH_ANNOUNCEMENTS`, `MAX_AGE_OF_SENDING_ANNOUNCEMENT_DAYS`,
+`DB_NAME` and `LIBRUS_DEBUG`. Use the INI file for several children or webhooks.
+
+The INI file contains your Librus and SMTP passwords, so make it readable only by you
+(`chmod 600 pylibrus.ini`).
+
+### Command-line options
+
+| Option | Meaning |
+| --- | --- |
+| `--workdir PATH` | directory with the config file, databases and cookie file (default: current directory) |
+| `--config PATH` | config file, absolute or relative to workdir (default: `pylibrus.ini`) |
+| `--cookies PATH` | cookie cache file, absolute or relative to workdir (default: `pylibrus_cookies.json`) |
+| `--test-notify` | send a fake message and a fake announcement to the **first** configured user's destination, without contacting Librus. Use it to check your SMTP or webhook settings. |
+| `--dry` | scrape everything and print what would be sent, without sending anything or marking anything as sent |
+| `--debug` | verbose logging |
+
+### Scheduling
+
+Run it from cron, for example every 5 minutes:
+
+```
+*/5 * * * * cd /path/to/pylibrus && uv run src/pylibrus/pylibrus.py --workdir /path/to/workdir
+```
+
+The [`Procfile`](Procfile) contains the same `*/5 * * * *` schedule, for hosts that read cron
+jobs from a Procfile.
+
+With several children, pyLibrus waits `sleep_between_librus_users` seconds between accounts so
+that Librus doesn't throttle the logins.
+
+### Files it creates
+
+All of these are in the working directory:
+
+* `pylibrus.sqlite`: every message, attachment and announcement seen so far, with whether it
+  was sent. All users share this file unless `db_name` is set. Deleting it makes pyLibrus
+  treat everything still within the age limit as new.
+* `pylibrus_cookies.json`: the cached Librus session. Safe to delete; the next run logs in
+  again.
 
 ## Webhook attachments in S3
 

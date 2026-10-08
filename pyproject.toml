@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = [
     {name = "gozdal"}
 ]
-description = "Message scraper from crappy Librus Synergia gradebook."
+description = "Message scraper from Librus Synergia gradebook."
 readme = "README.md"
 requires-python = ">=3.12"
 
