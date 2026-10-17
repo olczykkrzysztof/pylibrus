@@ -1,34 +1,28 @@
-"""Offline tests for the /ogloszenia parser (`LibrusScraper.fetch_announcements`) and
-`announcement_id()`. See ANNOUNCEMENTS_PLAN.md for the design this implements.
+"""Offline tests for the /ogloszenia parser (`parse_announcements`), the scraper method that
+fetches the page for it, and `announcement_id()`. See ANNOUNCEMENTS_PLAN.md for the design.
 
-No network access happens here: `LibrusScraper._get` is monkeypatched to return a fixed
-HTML fixture instead of hitting Librus.
+The parser is called directly on HTML; the fetch cases go through a FakeSession, so nothing
+here touches the network.
 """
 
 import datetime
 from pathlib import Path
 
 import pytest
+from fakes import FakeSession
 
 from pylibrus.pylibrus import LibrusScraper, PyLibrusConfig, announcement_id
+from pylibrus.scraper.parse import parse_announcements
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
-def _scraper_returning(tmp_path, html: str) -> LibrusScraper:
-    config = PyLibrusConfig(workdir=str(tmp_path))
-    scraper = LibrusScraper(login="test-user", passwd="test-pass", pylibrus_config=config)
-    scraper._get = lambda path, referer=None: type("FakeResponse", (), {"text": html})()
-    return scraper
+def _fixture(name: str) -> str:
+    return (FIXTURES_DIR / name).read_text(encoding="utf-8")
 
 
-def _scraper_for_fixture(tmp_path, fixture_name: str) -> LibrusScraper:
-    return _scraper_returning(tmp_path, (FIXTURES_DIR / fixture_name).read_text(encoding="utf-8"))
-
-
-def test_fetch_announcements_parses_fixture(tmp_path):
-    scraper = _scraper_for_fixture(tmp_path, "ogloszenia.html")
-    announcements = scraper.fetch_announcements()
+def test_parses_fixture():
+    announcements = parse_announcements(_fixture("ogloszenia.html"))
 
     assert len(announcements) == 2
 
@@ -43,12 +37,11 @@ def test_fetch_announcements_parses_fixture(tmp_path):
     assert second_title == "Odwołane zajęcia"
 
 
-def test_fetch_announcements_empty_page_returns_nothing(tmp_path):
-    scraper = _scraper_for_fixture(tmp_path, "ogloszenia_empty.html")
-    assert scraper.fetch_announcements() == []
+def test_empty_page_returns_nothing():
+    assert parse_announcements(_fixture("ogloszenia_empty.html")) == []
 
 
-def test_fetch_announcements_skips_table_with_unparseable_date(tmp_path):
+def test_skips_table_with_unparseable_date():
     html = """
     <table class="decorated big">
       <thead><tr><td>Zły termin</td></tr></thead>
@@ -58,11 +51,10 @@ def test_fetch_announcements_skips_table_with_unparseable_date(tmp_path):
       </tbody>
     </table>
     """
-    scraper = _scraper_returning(tmp_path, html)
-    assert scraper.fetch_announcements() == []
+    assert parse_announcements(html) == []
 
 
-def test_fetch_announcements_skips_table_with_missing_date(tmp_path):
+def test_skips_table_with_missing_date():
     html = """
     <table class="decorated big">
       <thead><tr><td>Bez daty</td></tr></thead>
@@ -72,11 +64,10 @@ def test_fetch_announcements_skips_table_with_missing_date(tmp_path):
       </tbody>
     </table>
     """
-    scraper = _scraper_returning(tmp_path, html)
-    assert scraper.fetch_announcements() == []
+    assert parse_announcements(html) == []
 
 
-def test_fetch_announcements_tolerates_unknown_field(tmp_path):
+def test_tolerates_unknown_field():
     # A future Librus markup change adding a new labelled row must not break parsing -
     # this is intentionally more forgiving than the reference implementations that raise.
     html = """
@@ -90,13 +81,12 @@ def test_fetch_announcements_tolerates_unknown_field(tmp_path):
       </tbody>
     </table>
     """
-    scraper = _scraper_returning(tmp_path, html)
-    announcements = scraper.fetch_announcements()
+    announcements = parse_announcements(html)
     assert len(announcements) == 1
     assert announcements[0][0] == "Z nowym polem"
 
 
-def test_fetch_announcements_without_content_row(tmp_path):
+def test_without_content_row():
     html = """
     <table class="decorated big">
       <thead><tr><td>Bez treści</td></tr></thead>
@@ -106,16 +96,27 @@ def test_fetch_announcements_without_content_row(tmp_path):
       </tbody>
     </table>
     """
-    scraper = _scraper_returning(tmp_path, html)
-    announcements = scraper.fetch_announcements()
+    announcements = parse_announcements(html)
     assert len(announcements) == 1
     _, _, _, contents_html, contents_text = announcements[0]
     assert contents_html == ""
     assert contents_text == ""
 
 
+def _scraper_serving(tmp_path, html: str) -> tuple[LibrusScraper, FakeSession]:
+    session = FakeSession({"/ogloszenia": html})
+    return LibrusScraper(session, PyLibrusConfig(workdir=str(tmp_path))), session
+
+
+def test_fetch_announcements_requests_the_page_and_parses_it(tmp_path):
+    scraper, session = _scraper_serving(tmp_path, _fixture("ogloszenia.html"))
+
+    assert scraper.fetch_announcements() == parse_announcements(_fixture("ogloszenia.html"))
+    assert session.requests == [("get", "/ogloszenia", "https://synergia.librus.pl/rodzic/index")]
+
+
 def test_fetch_announcements_raises_on_no_access(tmp_path):
-    scraper = _scraper_returning(tmp_path, "Brak dostępu")
+    scraper, _ = _scraper_serving(tmp_path, "Brak dostępu")
     with pytest.raises(RuntimeError):
         scraper.fetch_announcements()
 

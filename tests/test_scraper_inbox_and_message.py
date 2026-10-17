@@ -2,12 +2,14 @@
 
 These pin down what the current code extracts from a page, including the request paths and
 referers it sends, so that splitting parsing from fetching (REFACTOR_PLAN.md step 3) can prove
-it changed nothing. No network access happens here: `LibrusScraper._get` is monkeypatched to
-serve the fixtures and record what was asked for.
+it changed nothing. No network access happens here: a FakeSession serves the fixtures and
+records what was asked for.
 """
 
 import datetime
 from pathlib import Path
+
+from fakes import FakeSession
 
 from pylibrus.pylibrus import LibrusScraper, PyLibrusConfig
 
@@ -17,31 +19,20 @@ INBOX_PATH = "/wiadomosci/5"
 MSG_PATH = "/wiadomosci/1/5/1002/f0"
 
 
-class FakeResponse:
-    def __init__(self, text: str):
-        self.text = text
-
-
-def _scraper(tmp_path, max_age_days=36500) -> tuple[LibrusScraper, list[tuple[str, str]]]:
-    """Returns a scraper serving the inbox and message fixtures, plus the (path, referer) log."""
+def _scraper(tmp_path, max_age_days=36500) -> tuple[LibrusScraper, FakeSession]:
+    """Returns a scraper serving the inbox and message fixtures, plus its session's request log."""
     config = PyLibrusConfig(workdir=str(tmp_path), max_age_of_sending_msg_days=max_age_days)
-    scraper = LibrusScraper(login="test-user", passwd="test-pass", pylibrus_config=config)
-    pages = {
-        INBOX_PATH: (FIXTURES_DIR / "wiadomosci_odebrane.html").read_text(encoding="utf-8"),
-        MSG_PATH: (FIXTURES_DIR / "wiadomosc.html").read_text(encoding="utf-8"),
-    }
-    requests_made = []
-
-    def fake_get(path, referer=None, **kwargs):
-        requests_made.append((path, referer))
-        return FakeResponse(pages[path])
-
-    scraper._get = fake_get
-    return scraper, requests_made
+    session = FakeSession(
+        {
+            INBOX_PATH: (FIXTURES_DIR / "wiadomosci_odebrane.html").read_text(encoding="utf-8"),
+            MSG_PATH: (FIXTURES_DIR / "wiadomosc.html").read_text(encoding="utf-8"),
+        },
+    )
+    return LibrusScraper(session, config), session
 
 
 def test_inbox_lists_links_and_unread_state(tmp_path):
-    scraper, requests_made = _scraper(tmp_path)
+    scraper, session = _scraper(tmp_path)
 
     msgs = scraper.msgs_from_folder(5)
 
@@ -54,11 +45,11 @@ def test_inbox_lists_links_and_unread_state(tmp_path):
         ("/wiadomosci/1/5/1003/f0", False),  # one bold cell is enough
         ("/wiadomosci/1/5/1001/f0", True),
     ]
-    assert requests_made == [(INBOX_PATH, "https://synergia.librus.pl/rodzic/index")]
+    assert session.requests == [("get", INBOX_PATH, "https://synergia.librus.pl/rodzic/index")]
 
 
 def test_message_headers_contents_and_attachment_refs(tmp_path):
-    scraper, requests_made = _scraper(tmp_path)
+    scraper, session = _scraper(tmp_path)
     scraper.msgs_from_folder(5)
 
     sender, subject, date, contents_html, contents_text, attachments = scraper.fetch_msg(MSG_PATH, False)
@@ -74,7 +65,7 @@ def test_message_headers_contents_and_attachment_refs(tmp_path):
         ("1002/77", MSG_PATH, "zgoda.pdf", None),
     ]
     # The message is fetched with the inbox page as referer, the way the browser does it.
-    assert requests_made[-1] == (MSG_PATH, "https://synergia.librus.pl/wiadomosci/5")
+    assert session.requests[-1] == ("get", MSG_PATH, "https://synergia.librus.pl/wiadomosci/5")
 
 
 def test_message_older_than_max_age_is_dropped(tmp_path):

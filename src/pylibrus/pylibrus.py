@@ -31,8 +31,12 @@ from pylibrus.db.schema import Base as Base
 from pylibrus.db.schema import LibrusAnnouncement as LibrusAnnouncement
 from pylibrus.db.schema import Msg as Msg
 from pylibrus.db.store import MessageStore as MessageStore
-from pylibrus.scraper.client import FAILED_TO_DOWNLOAD_ATTACHMENT_DATA as FAILED_TO_DOWNLOAD_ATTACHMENT_DATA
+from pylibrus.logging_setup import configure_logging as configure_logging
+from pylibrus.scraper.attachments import FAILED_TO_DOWNLOAD_ATTACHMENT_DATA as FAILED_TO_DOWNLOAD_ATTACHMENT_DATA
 from pylibrus.scraper.client import LibrusScraper as LibrusScraper
+from pylibrus.scraper.client import open_scraper as open_scraper
+from pylibrus.scraper.session import LibrusSession as LibrusSession
+from pylibrus.scraper.urls import attachment_download_link as attachment_download_link
 from pylibrus.settings import DEFAULT_WEBHOOK_ATTACHMENTS_SOURCE as DEFAULT_WEBHOOK_ATTACHMENTS_SOURCE
 from pylibrus.settings import EmailNotify as EmailNotify
 from pylibrus.settings import LibrusUser as LibrusUser
@@ -119,13 +123,13 @@ class LibrusNotifier:
 
     @staticmethod
     def _librus_attachment_links(attachments: list[Attachment]) -> list[tuple[str, str]]:
-        return [(a.name, LibrusScraper.get_attachment_download_link(a.link_id)) for a in attachments]
+        return [(a.name, attachment_download_link(a.link_id)) for a in attachments]
 
     def _s3_attachment_links(self, msg_from_db, attachments: list[Attachment]) -> list[tuple[str, str]]:
         links: list[tuple[str, str]] = []
         storage = S3AttachmentStorage(self._librus_user.notify)
         for attach in attachments:
-            fallback_link = LibrusScraper.get_attachment_download_link(attach.link_id)
+            fallback_link = attachment_download_link(attach.link_id)
             if attach.data is None:
                 logger.warning(f"Attachment '{attach.name}' has no data in DB, fallback to Librus link")
                 links.append((attach.name, fallback_link))
@@ -217,7 +221,7 @@ class LibrusNotifier:
             if not attachments_only_with_link
             else "\n\nZałączniki:\n"
             + "\n - ".join(
-                LibrusScraper.get_attachment_download_link(att.link_id) for att in attachments_only_with_link
+                attachment_download_link(att.link_id) for att in attachments_only_with_link
             )
         )
         attachments_as_html_msg = (
@@ -225,7 +229,7 @@ class LibrusNotifier:
             if not attachments_only_with_link
             else "<br/><br/><p>Załączniki:<p><ul>"
             + "".join(
-                f"<li><a href='{LibrusScraper.get_attachment_download_link(att.link_id)}'>{att.name}</a></li>"
+                f"<li><a href='{attachment_download_link(att.link_id)}'>{att.name}</a></li>"
                 for att in attachments_only_with_link
             )
             + "</ul>"
@@ -554,7 +558,7 @@ def notify_collected(pylibrus_config: PyLibrusConfig, collections: list[UserColl
 
 def handle_user(pylibrus_config: PyLibrusConfig, librus_user: LibrusUser, dry_run: bool = False):
     """Collects and notifies a single user. Cross-user grouping needs main()'s loop."""
-    with LibrusScraper(librus_user.login, librus_user.password, pylibrus_config=pylibrus_config) as scraper:
+    with open_scraper(pylibrus_config, librus_user) as scraper:
         with LibrusNotifier(pylibrus_config, librus_user) as notifier:
             collection = collect_user(pylibrus_config, librus_user, scraper, notifier)
             notify_collected(pylibrus_config, [collection], dry_run=dry_run)
@@ -616,6 +620,10 @@ def main():
     logger.info(f"Config: {pylibrus_config}")
     for user in librus_users:
         logger.info(f"User: {user}")
+    # Only now, so the two lines above stay unprinted as they always have been (logging used to be
+    # configured by the first LibrusScraper, created after them): printing them would put each
+    # user's webhook URL - a credential - in the cron log on every run.
+    configure_logging(pylibrus_config.debug)
 
     if args.test_notify:
         return send_test_notification(pylibrus_config, librus_users[0])
@@ -628,9 +636,7 @@ def main():
         for i, librus_user in enumerate(librus_users):
             try:
                 notifier = stack.enter_context(LibrusNotifier(pylibrus_config, librus_user))
-                with LibrusScraper(
-                    librus_user.login, librus_user.password, pylibrus_config=pylibrus_config,
-                ) as scraper:
+                with open_scraper(pylibrus_config, librus_user) as scraper:
                     collections.append(collect_user(pylibrus_config, librus_user, scraper, notifier))
             except Exception:
                 # One broken account (changed password, throttling) must not stop the other
