@@ -12,6 +12,44 @@ call or an SMTP connection.
 This document proposes a target layout, explains the seams that make each part testable, and
 gives an incremental migration order where every step leaves the tree green.
 
+## Progress
+
+**Steps 0-5 are done**, one commit per step (steps 3, 4 and 5 split further, so a bisect can tell
+a move from a change). Where the code deviates from the plan below, and what that means for the
+remaining steps:
+
+- **Settings moved in step 1, not 7.** `WebhookNotify` calls `parse_s3_source`, and every later
+  package needs the settings types, so leaving them in `pylibrus.py` would have made it and the
+  new modules import each other. Only the verbatim move is done; the field spec (step 7) is not.
+- **Message parsing is three functions, not one `parse_message()`**: `parse_message_header()`,
+  `parse_message_body()`, `parse_attachment_rows()`. `fetch_msg()` applies the age filter right
+  after the header, so an old message is never body-parsed and never has its attachments
+  downloaded. **When the age filter moves out of the scraper (problem 4), it must still run
+  before the body parse and the download** - moving it after `fetch_msg()` would download every
+  attachment of every old message on a fresh DB.
+- **The scraper's return types are unchanged.** `fetch_msg()` still returns the 6-tuple with ORM
+  `Attachment` rows and still applies the age filter; the `models.py` values are NamedTuples
+  matching the old tuples. So problem 4 is still open; it fits step 6, which changes what
+  crosses the phase boundary anyway.
+- **`collect_all()` is a context manager** (`with collect_all(config, users) as collections:`)
+  rather than returning a list: the notifiers it opens must outlive the collect phase, and the
+  `with` block enforces that.
+- **Logging.** `configure_logging()` runs from `main()` right after the `Config:`/`User:` lines,
+  which have never printed (logging used to be configured by the first scraper, created after
+  them) and would print each user's webhook URL if they did. Showing them needs `repr=False` on
+  `WebhookNotify.webhook` first. The one visible change: `--test-notify`, which printed nothing,
+  now logs its progress.
+- **Small additions**: `scraper/urls.py` (URL helpers shared by the session, the scraper and the
+  notifiers' attachment links); `notify/smtp.py` instead of `notify/email.py` (no confusion
+  with the stdlib `email` package the renderer imports); `notify/notifier.py` holding
+  `make_notifier()` and the transitional `LibrusNotifier` (store + sender) that step 6
+  dissolves; `FakeSession` in `tests/fakes.py` rather than conftest.py, so tests can import it.
+- **Not done** from the "why" section: `RunSummary`, and the `tests/unit` / `tests/integration`
+  split (new test files use the names from section 3, flat in `tests/`).
+- Moved code moved byte-for-byte, formatting included, so `ruff format --check` still flags it
+  as it flagged `pylibrus.py`; the 5 pre-existing `ruff check` findings (three `sha1`, one
+  `random`, one `requests.post` without a timeout) moved with their code.
+
 ## 1. What blocks testing today
 
 | # | Problem | Where | Consequence |
@@ -37,14 +75,15 @@ src/pylibrus/
     settings.py            # PyLibrusConfig, LibrusUser, EmailNotify, WebhookNotify + field spec
                            #   (destination_key() lives here, derived from the spec)
     config_loader.py       # read_pylibrus_config(): INI vs env source selection + config warnings
-    models.py              # domain dataclasses (no SQLAlchemy): ParsedMessage, ParsedAnnouncement,
-                           #   AttachmentRef, StoredItem, NotificationStyle
+    models.py              # values (no SQLAlchemy): InboxEntry, MessageHeader, AttachmentRef,
+                           #   ParsedAnnouncement; StoredItem, NotificationStyle in step 6
     scraper/
         __init__.py        # re-export LibrusScraper
         session.py         # LibrusSession: requests.Session, cookie persistence, the OAuth dance
         cookies.py         # load/store cookie JSON (pure functions over a Path)
         parse.py           # html -> domain objects. No network, no ORM, no config.
         attachments.py     # the sandbox.librus.pl single-use-key download dance
+        urls.py            # Librus URL helpers (session, scraper, attachment links)
         client.py          # LibrusScraper: composes session + parse into fetch_* methods
     db/
         __init__.py
@@ -63,8 +102,9 @@ src/pylibrus/
         __init__.py
         base.py            # Notifier protocol: notify(item, display_name)
         render.py          # build_email_message() -> EmailMessage, build_webhook_payload() -> dict. Pure.
-        email.py           # SmtpNotifier: render + smtplib
+        smtp.py            # SmtpNotifier: render + smtplib
         webhook.py         # WebhookNotifier: render + requests.post
+        notifier.py        # make_notifier(); LibrusNotifier (store + sender) until step 6
     storage/
         __init__.py
         s3.py              # S3AttachmentStorage, key building, pre-signed links
