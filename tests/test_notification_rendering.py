@@ -19,6 +19,10 @@ import boto3
 import pytest
 import requests
 
+from pylibrus.db.store import MessageStore
+from pylibrus.notify.notifier import make_notifier
+from pylibrus.notify.smtp import SmtpNotifier
+from pylibrus.notify.webhook import WebhookNotifier
 from pylibrus.pylibrus import Attachment, EmailNotify, LibrusNotifier, LibrusUser, Msg, WebhookNotify
 
 MSG_URL = "/wiadomosci/1/5/1002/f0"
@@ -340,3 +344,11 @@ def test_webhook_s3_attachment_without_data_falls_back_to_the_librus_link(config
 
     assert s3.uploads == []
     assert json.loads(posts[0]["data"])["text"].endswith(f"- <{LINK_77}|zgoda.pdf>\n")
+
+
+# --- transport selection ---------------------------------------------------------------------
+
+
+def test_each_destination_type_gets_its_transport(config):
+    assert isinstance(make_notifier(email_user(), MessageStore(config.workdir, "x.sqlite")), SmtpNotifier)
+    assert isinstance(make_notifier(webhook_user(), MessageStore(config.workdir, "x.sqlite")), WebhookNotifier)

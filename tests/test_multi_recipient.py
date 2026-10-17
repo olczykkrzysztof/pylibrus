@@ -13,11 +13,12 @@ import contextlib
 import datetime
 import email
 import logging
+import smtplib
 from email.header import decode_header, make_header
 
 import pytest
+import requests
 
-import pylibrus.pylibrus as P
 from pylibrus.pylibrus import (
     EmailNotify,
     LibrusNotifier,
@@ -478,7 +479,7 @@ def test_webhook_header_leaves_the_redundant_name_out_too(config, monkeypatch):
         posted["data"] = data
         return FakeResponse()
 
-    monkeypatch.setattr(P.requests, "post", fake_post)
+    monkeypatch.setattr(requests, "post", fake_post)
 
     webhook = WebhookNotify(webhook="https://hooks.example.com/parents")
     users = [
@@ -514,7 +515,7 @@ def test_email_subject_leaves_the_redundant_name_out_too(config, monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(P.smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
 
     dest = email_to("parents@example.com")
     users = [

@@ -3,9 +3,7 @@ import configparser
 import contextlib
 import dataclasses
 import datetime
-import json
 import logging
-import smtplib
 import sys
 import time
 from pathlib import Path
@@ -19,7 +17,6 @@ if __name__ == "__main__" and not __package__:
     sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != _here]
     sys.path.insert(0, str(_here.parent))
 
-import requests
 
 from pylibrus.db.schema import Attachment as Attachment
 from pylibrus.db.schema import Base as Base
@@ -27,9 +24,14 @@ from pylibrus.db.schema import LibrusAnnouncement as LibrusAnnouncement
 from pylibrus.db.schema import Msg as Msg
 from pylibrus.db.store import MessageStore as MessageStore
 from pylibrus.logging_setup import configure_logging as configure_logging
+from pylibrus.notify.base import Notifier as Notifier
+from pylibrus.notify.notifier import LibrusNotifier as LibrusNotifier
+from pylibrus.notify.notifier import make_notifier as make_notifier
 from pylibrus.notify.render import build_email_message as build_email_message
 from pylibrus.notify.render import build_webhook_payload as build_webhook_payload
 from pylibrus.notify.render import format_sender as format_sender
+from pylibrus.notify.smtp import SmtpNotifier as SmtpNotifier
+from pylibrus.notify.webhook import WebhookNotifier as WebhookNotifier
 from pylibrus.scraper.attachments import FAILED_TO_DOWNLOAD_ATTACHMENT_DATA as FAILED_TO_DOWNLOAD_ATTACHMENT_DATA
 from pylibrus.scraper.client import LibrusScraper as LibrusScraper
 from pylibrus.scraper.client import open_scraper as open_scraper
@@ -56,143 +58,6 @@ from pylibrus.utils import str_to_bool as str_to_bool
 from pylibrus.utils import str_to_int as str_to_int
 
 logger = logging.getLogger(__name__)
-
-
-class LibrusNotifier:
-    """One Librus user's sender, plus the MessageStore holding the rows it sends.
-
-    The store and the sending live together until the collect phase stops handing live ORM rows
-    to the notify phase (REFACTOR_PLAN.md step 6); until then the store methods are delegated.
-    """
-
-    def __init__(self, pylibrus_config: PyLibrusConfig, librus_user: LibrusUser):
-        self._pylibrus_config = pylibrus_config
-        self._librus_user = librus_user
-        self._store = MessageStore(pylibrus_config.workdir, librus_user.db_name)
-
-    def __enter__(self):
-        self._store.__enter__()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._store.__exit__(exc_type, exc_val, exc_tb)
-
-    @property
-    def librus_user(self) -> LibrusUser:
-        return self._librus_user
-
-    @property
-    def store(self) -> MessageStore:
-        return self._store
-
-    def commit(self):
-        """See MessageStore.commit(): called at each phase boundary, not only at __exit__."""
-        self._store.commit()
-
-    def get_msg(self, url):
-        return self._store.get_msg(url)
-
-    def add_msg(self, url, folder_id, sender, date, subject, contents_html, contents_text, attachments):
-        return self._store.add_msg(url, folder_id, sender, date, subject, contents_html, contents_text, attachments)
-
-    def get_announcement(self, url):
-        return self._store.get_announcement(url)
-
-    def add_announcement(self, url, sender, subject, date, contents_html, contents_text):
-        return self._store.add_announcement(url, sender, subject, date, contents_html, contents_text)
-
-    def notify(self, msg_from_db, display_name: str | None = None):
-        """Sends one item out. `display_name` overrides the Librus user name shown to the reader.
-
-        It carries the names of *every* child the item was sent to, so the reader can tell
-        whether it concerns one child or several; it defaults to this notifier's own user.
-        """
-        if self._librus_user.notify.is_webhook():
-            logger.info(f"Sending '{msg_from_db.subject}' to webhook from {msg_from_db.sender} ({msg_from_db.date})")
-            self.send_via_webhook(msg_from_db, display_name)
-        else:
-            logger.info(
-                f"Sending '{msg_from_db.subject}' to {self._librus_user.notify.email_dest} from {msg_from_db.sender}"
-            )
-            self.send_email(msg_from_db, display_name)
-
-    def _get_attachments(self, msg_from_db) -> list[Attachment]:
-        return self._store.attachments_for(msg_from_db.url)
-
-    @staticmethod
-    def _librus_attachment_links(attachments: list[Attachment]) -> list[tuple[str, str]]:
-        return [(a.name, attachment_download_link(a.link_id)) for a in attachments]
-
-    def _s3_attachment_links(self, msg_from_db, attachments: list[Attachment]) -> list[tuple[str, str]]:
-        links: list[tuple[str, str]] = []
-        storage = S3AttachmentStorage(self._librus_user.notify)
-        for attach in attachments:
-            fallback_link = attachment_download_link(attach.link_id)
-            if attach.data is None:
-                logger.warning(f"Attachment '{attach.name}' has no data in DB, fallback to Librus link")
-                links.append((attach.name, fallback_link))
-                continue
-            try:
-                if not attach.s3_key:
-                    s3_key, s3_etag = storage.upload_attachment(
-                        librus_user_name=self._librus_user.name,
-                        msg_path=msg_from_db.url,
-                        attachment=attach,
-                    )
-                    attach.s3_key = s3_key
-                    attach.s3_etag = s3_etag
-                    attach.s3_upload_date = datetime.datetime.now()
-                    logger.info(f"Uploaded attachment '{attach.name}' to S3 key '{attach.s3_key}'")
-                else:
-                    logger.info(f"Reusing uploaded S3 key for attachment '{attach.name}': {attach.s3_key}")
-                links.append((attach.name, storage.generate_download_link(attach)))
-            except Exception as ex:
-                logger.warning(f"Failed to upload/presign attachment '{attach.name}' ({ex}), fallback to Librus link")
-                links.append((attach.name, fallback_link))
-        return links
-
-    def _build_webhook_attachment_links(self, msg_from_db) -> list[tuple[str, str]]:
-        attachments = self._get_attachments(msg_from_db)
-        if not attachments:
-            return []
-        if not is_s3_webhook_source(self._librus_user.notify.webhook_attachments_source):
-            return self._librus_attachment_links(attachments)
-        try:
-            return self._s3_attachment_links(msg_from_db, attachments)
-        except Exception as ex:
-            logger.warning(f"Failed to initialize S3 attachment storage ({ex}), fallback to Librus links")
-            return self._librus_attachment_links(attachments)
-
-    def send_via_webhook(self, msg_from_db, display_name: str | None = None):
-        attachment_links = self._build_webhook_attachment_links(msg_from_db)
-        name = display_name or self._librus_user.name
-
-        message = build_webhook_payload(msg_from_db, name, attachment_links)
-
-        response = requests.post(
-            self._librus_user.notify.webhook,
-            data=json.dumps(message),
-            headers={"Content-Type": "application/json"},
-        )
-
-        if response.status_code != 200:
-            logger.warning(f"Failed to send message. Status code: {response.status_code}")
-
-    def send_email(self, msg_from_db, display_name: str | None = None):
-        name = display_name or self._librus_user.name
-        msg = build_email_message(
-            msg_from_db,
-            name,
-            self._librus_user.notify,
-            self._store.attachments_for(msg_from_db.url),  # none when testing: the store isn't open
-        )
-
-        server = smtplib.SMTP(self._librus_user.notify.smtp_server, self._librus_user.notify.smtp_port)
-        server.ehlo()
-        server.starttls()
-        server.login(self._librus_user.notify.smtp_user, self._librus_user.notify.smtp_pass)
-        server.sendmail(self._librus_user.notify.smtp_user, self._librus_user.notify.email_dest, msg.as_string())
-        server.close()
 
 
 def read_pylibrus_config(workdir: str, config_file: str) -> tuple[PyLibrusConfig, list[LibrusUser]]:
