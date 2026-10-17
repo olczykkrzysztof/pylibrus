@@ -4,7 +4,6 @@ import configparser
 import contextlib
 import dataclasses
 import datetime
-import hashlib
 import json
 import logging
 import random
@@ -30,11 +29,13 @@ if __name__ == "__main__" and not __package__:
 
 import requests
 from bs4 import BeautifulSoup
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, LargeBinary, String, inspect, text
-from sqlalchemy.engine import create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
 from user_agent import generate_user_agent
 
+from pylibrus.db.schema import Attachment as Attachment
+from pylibrus.db.schema import Base as Base
+from pylibrus.db.schema import LibrusAnnouncement as LibrusAnnouncement
+from pylibrus.db.schema import Msg as Msg
+from pylibrus.db.store import MessageStore as MessageStore
 from pylibrus.settings import DEFAULT_WEBHOOK_ATTACHMENTS_SOURCE as DEFAULT_WEBHOOK_ATTACHMENTS_SOURCE
 from pylibrus.settings import EmailNotify as EmailNotify
 from pylibrus.settings import LibrusUser as LibrusUser
@@ -55,71 +56,9 @@ from pylibrus.utils import retrieve_from as retrieve_from
 from pylibrus.utils import str_to_bool as str_to_bool
 from pylibrus.utils import str_to_int as str_to_int
 
-Base = declarative_base()
-
 FAILED_TO_DOWNLOAD_ATTACHMENT_DATA = "Failed to download attachment data!"
 
 logger = logging.getLogger(__name__)
-
-
-class Msg(Base):
-    __tablename__ = "messages"
-
-    url = Column(String, primary_key=True)
-    folder = Column(Integer)
-    sender = Column(String)
-    subject = Column(String)
-    date = Column(DateTime)
-    contents_html = Column(String)
-    contents_text = Column(String)
-    email_sent = Column(Boolean, default=False)
-
-    # No subject prefix/banner override for regular messages; see LibrusAnnouncement.
-    subject_prefix = ""
-    banner_text = "TO WIADOMOŚĆ Z LIBRUSA, NIE ODPOWIADAJ NA NIĄ MEJLEM"
-    banner_html = "To wiadomość z Librusa, nie odpowiadaj na nią mejlem"
-    webhook_item_label = "Temat"
-
-
-class Attachment(Base):
-    __tablename__ = "attachments"
-
-    link_id = Column(String, primary_key=True)  # link_id seems to contain message id and attachment id
-    msg_path = Column(String, ForeignKey(Msg.url))
-    name = Column(String)
-    data = Column(LargeBinary)
-    s3_key = Column(String, nullable=True)
-    s3_upload_date = Column(DateTime, nullable=True)
-    s3_etag = Column(String, nullable=True)
-
-
-class LibrusAnnouncement(Base):
-    """A Librus announcement (AKA 'ogłoszenie'), scraped from /ogloszenia.
-
-    Announcements have no stable id and no per-item read/unread flag (see
-    ANNOUNCEMENTS_PLAN.md), so `url` is a synthetic key derived from title+author+date
-    (see `announcement_id()`) rather than a real Librus URL, and `email_sent` is the
-    only dedupe signal - `send_message=unread` semantics do not apply here.
-
-    Column names deliberately match `Msg` so `LibrusNotifier.notify()` and friends can
-    treat both the same way; `contents_html`/`contents_text` hold the announcement body.
-    """
-
-    __tablename__ = "announcements"
-
-    url = Column(String, primary_key=True)  # synthetic, see announcement_id()
-    sender = Column(String)  # "Dodał"
-    subject = Column(String)  # title
-    date = Column(DateTime)  # "Data publikacji" (date only, no time)
-    contents_html = Column(String)
-    contents_text = Column(String)
-    content_hash = Column(String, nullable=True)  # sha1 of contents_text; unused today, for future edit-detection
-    email_sent = Column(Boolean, default=False)
-
-    subject_prefix = "Ogłoszenie: "
-    banner_text = "TO OGŁOSZENIE Z LIBRUSA, NIE ODPOWIADAJ NA NIE MEJLEM"
-    banner_html = "To ogłoszenie z Librusa, nie odpowiadaj na nie mejlem"
-    webhook_item_label = "Ogłoszenie"
 
 
 class LibrusScraper:
@@ -535,108 +474,47 @@ class LibrusScraper:
 
 
 class LibrusNotifier:
+    """One Librus user's sender, plus the MessageStore holding the rows it sends.
+
+    The store and the sending live together until the collect phase stops handing live ORM rows
+    to the notify phase (REFACTOR_PLAN.md step 6); until then the store methods are delegated.
+    """
+
     def __init__(self, pylibrus_config: PyLibrusConfig, librus_user: LibrusUser):
         self._pylibrus_config = pylibrus_config
         self._librus_user = librus_user
-        self._engine = None
-        self._session = None
-
-    def _create_db(self):
-        workdir_path = Path(self._pylibrus_config.workdir)
-        if not workdir_path.exists():
-            raise RuntimeError(f"Workdir {workdir_path} does not exist")
-        self._engine = create_engine(f"sqlite:///{workdir_path / self._librus_user.db_name}")
-        Base.metadata.create_all(self._engine)
-        self._migrate_tables()
-        session_maker = sessionmaker(bind=self._engine)
-        self._session = session_maker()
-
-    def _migrate_tables(self):
-        # Hand-rolled additive migration (no Alembic here, see CLAUDE.md): new nullable
-        # columns on any table need an explicit ALTER TABLE below, or existing users'
-        # DBs won't pick them up. `announcements` is created fresh by create_all() above
-        # for everyone, so it needs no migration today - this is the home for its future
-        # column additions.
-        inspector = inspect(self._engine)
-        migrations = []
-        if inspector.has_table("attachments"):
-            existing = {c["name"] for c in inspector.get_columns("attachments")}
-            if "s3_key" not in existing:
-                migrations.append("ALTER TABLE attachments ADD COLUMN s3_key TEXT")
-            if "s3_upload_date" not in existing:
-                migrations.append("ALTER TABLE attachments ADD COLUMN s3_upload_date DATETIME")
-            if "s3_etag" not in existing:
-                migrations.append("ALTER TABLE attachments ADD COLUMN s3_etag TEXT")
-        if not migrations:
-            return
-        with self._engine.begin() as connection:
-            for command in migrations:
-                connection.execute(text(command))
+        self._store = MessageStore(pylibrus_config.workdir, librus_user.db_name)
 
     def __enter__(self):
-        self._create_db()
+        self._store.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is None:
-            if self._session:
-                self._session.commit()
-        else:
-            self._session.rollback()
+        self._store.__exit__(exc_type, exc_val, exc_tb)
 
     @property
     def librus_user(self) -> LibrusUser:
         return self._librus_user
 
-    def commit(self):
-        """Flushes pending writes now instead of at __exit__.
+    @property
+    def store(self) -> MessageStore:
+        return self._store
 
-        Several notifiers are open at once during a run (one per Librus user) and by default
-        they all point at the same SQLite file. SQLAlchemy defers BEGIN until the first DML, so
-        one session sitting on uncommitted INSERTs holds a write lock that makes the next
-        user's INSERT fail with "database is locked" - hence committing eagerly at each phase
-        boundary rather than relying on __exit__ alone. See MULTI_RECIPIENT_PLAN.md.
-        """
-        if self._session:
-            self._session.commit()
+    def commit(self):
+        """See MessageStore.commit(): called at each phase boundary, not only at __exit__."""
+        self._store.commit()
 
     def get_msg(self, url):
-        return self._session.get(Msg, url)
+        return self._store.get_msg(url)
 
     def add_msg(self, url, folder_id, sender, date, subject, contents_html, contents_text, attachments):
-        msg = self.get_msg(url)
-        if not msg:
-            msg = Msg(
-                url=url,
-                folder=folder_id,
-                sender=sender,
-                date=date,
-                subject=subject,
-                contents_html=contents_html,
-                contents_text=contents_text,
-            )
-            self._session.add(msg)
-            for attachment in attachments:
-                self._session.add(attachment)
-        return msg
+        return self._store.add_msg(url, folder_id, sender, date, subject, contents_html, contents_text, attachments)
 
     def get_announcement(self, url):
-        return self._session.get(LibrusAnnouncement, url)
+        return self._store.get_announcement(url)
 
     def add_announcement(self, url, sender, subject, date, contents_html, contents_text):
-        announcement = self.get_announcement(url)
-        if not announcement:
-            announcement = LibrusAnnouncement(
-                url=url,
-                sender=sender,
-                subject=subject,
-                date=date,
-                contents_html=contents_html,
-                contents_text=contents_text,
-                content_hash=hashlib.sha1(contents_text.encode()).hexdigest(),
-            )
-            self._session.add(announcement)
-        return announcement
+        return self._store.add_announcement(url, sender, subject, date, contents_html, contents_text)
 
     def notify(self, msg_from_db, display_name: str | None = None):
         """Sends one item out. `display_name` overrides the Librus user name shown to the reader.
@@ -654,9 +532,7 @@ class LibrusNotifier:
             self.send_email(msg_from_db, display_name)
 
     def _get_attachments(self, msg_from_db) -> list[Attachment]:
-        if not self._session:
-            return []
-        return self._session.query(Attachment).filter(Attachment.msg_path == msg_from_db.url).all()
+        return self._store.attachments_for(msg_from_db.url)
 
     @staticmethod
     def _librus_attachment_links(attachments: list[Attachment]) -> list[tuple[str, str]]:
@@ -748,13 +624,11 @@ class LibrusNotifier:
 
         attachments_only_with_link: list[Attachment] = []
         attachments_with_data: list[Attachment] = []
-        if self._session:  # sending testing email doesn't have opened session
-            attachments = self._session.query(Attachment).filter(Attachment.msg_path == msg_from_db.url).all()
-            for attach in attachments:
-                if attach.data is None:
-                    attachments_only_with_link.append(attach)
-                else:
-                    attachments_with_data.append(attach)
+        for attach in self._store.attachments_for(msg_from_db.url):  # none when testing: the store isn't open
+            if attach.data is None:
+                attachments_only_with_link.append(attach)
+            else:
+                attachments_with_data.append(attach)
         attachments_as_text_msg = (
             ""
             if not attachments_only_with_link

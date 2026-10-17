@@ -68,7 +68,7 @@ def test_old_announcement_is_never_sent_or_stored(tmp_path):
         assert notifier.sent_subjects == []
         # Too-old announcements must not even be persisted (mirrors fetch_msg()'s
         # age-skip for messages, which also never reaches add_msg()).
-        assert notifier._session.query(LibrusAnnouncement).count() == 0
+        assert notifier.store.session.query(LibrusAnnouncement).count() == 0
 
 
 def test_max_age_of_sending_announcement_days_overrides_message_default(tmp_path):
@@ -98,7 +98,7 @@ def test_dry_run_does_not_notify_or_mark_sent(tmp_path):
         assert notifier.sent_subjects == []
         # A dry run still persists the announcement (so its title/dedupe-id is known)
         # but must not mark it as sent.
-        stored = notifier._session.query(LibrusAnnouncement).one()
+        stored = notifier.store.session.query(LibrusAnnouncement).one()
         assert stored.email_sent is False
 
     # A subsequent regular run must still send it normally.

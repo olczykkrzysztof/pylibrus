@@ -4,7 +4,7 @@ download headers. `boto3.client` is faked, so no AWS call happens."""
 import boto3
 import pytest
 
-from pylibrus.pylibrus import Attachment
+from pylibrus.db.schema import Attachment
 from pylibrus.settings import WebhookNotify
 from pylibrus.storage.s3 import (
     S3AttachmentStorage,

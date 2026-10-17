@@ -9,7 +9,7 @@ from urllib.parse import quote
 import boto3
 
 if TYPE_CHECKING:
-    from pylibrus.pylibrus import Attachment
+    from pylibrus.db.schema import Attachment
     from pylibrus.settings import WebhookNotify
 
 LINK_EXPIRE_DURATION = 604800  # 7 days is maximum possible for S3 pre-signed URLs
