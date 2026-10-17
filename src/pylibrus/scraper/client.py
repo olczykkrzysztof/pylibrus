@@ -5,7 +5,6 @@ import random
 import sys
 import time
 from http import client as http_client
-from itertools import chain
 from pathlib import Path
 
 import requests
@@ -13,6 +12,14 @@ from bs4 import BeautifulSoup
 from user_agent import generate_user_agent
 
 from pylibrus.db.schema import Attachment
+from pylibrus.models import ParsedAnnouncement
+from pylibrus.scraper.parse import (
+    parse_announcements,
+    parse_attachment_rows,
+    parse_inbox,
+    parse_message_body,
+    parse_message_header,
+)
 from pylibrus.settings import PyLibrusConfig
 from pylibrus.utils import retrieve_from
 
@@ -233,52 +240,11 @@ class LibrusScraper:
 
     "#body > div.container.static > div > table > tbody > tr:nth-child(1) > td"
 
-    @staticmethod
-    def _find_msg_header(soup, name):
-        header = soup.find_all(string=name)
-        return header[0].parent.parent.parent.find_all("td")[1].text.strip()
-
     def fetch_attachments(self, msg_path, soup, fetch_content):
-        header = soup.find_all(string="Pliki:")
-        if not header:
-            return []
-
-        def get_attachments_without_data() -> list[Attachment]:
-            attachments = []
-            for attachment in header[0].parent.parent.parent.next_siblings:
-                r"""Example of str(attachment):
-                <tr>
-                <td>
-                <!-- icon -->
-                <img src="/assets/img/filetype_icons/doc.png"/>
-                <!-- name -->
-                                        KOPIOWANIE.docx                    </td>
-                <td>
-                                         
-                                        <!-- download button -->
-                <a href="javascript:void(0);">
-                <img class="" onclick='
-
-                                        otworz_w_nowym_oknie(
-                                            "\/wiadomosci\/pobierz_zalacznik\/4921079\/3664030",
-                                            "o2",
-                                            420,
-                                            250                        )
-
-                                                    ' src="/assets/img/homework_files_icons/download.png" title=""/>
-                </a>
-                </td>
-                </tr>
-                """
-                name = retrieve_from(str(attachment), "<!-- name -->", "</td>")
-                if not name:
-                    continue
-                link_id = retrieve_from(str(attachment).replace("\\", ""), "/wiadomosci/pobierz_zalacznik/", '",')
-                attachments.append(Attachment(link_id=link_id, msg_path=msg_path, name=name, data=None))
-
-            return attachments
-
-        attachments = get_attachments_without_data()
+        attachments = [
+            Attachment(link_id=ref.link_id, msg_path=msg_path, name=ref.name, data=None)
+            for ref in parse_attachment_rows(soup)
+        ]
 
         if not fetch_content:
             return attachments
@@ -338,50 +304,28 @@ class LibrusScraper:
     def fetch_msg(self, msg_path, fetch_attchement_content: bool):
         msg_page = self._get(msg_path, referer=self.synergia_url_from_path(self._last_folder_msg_path)).text
         soup = BeautifulSoup(msg_page, "html.parser")
-        sender = self._find_msg_header(soup, "Nadawca")
-        subject = self._find_msg_header(soup, "Temat")
-        date_string = self._find_msg_header(soup, "Wysłano")
-        date = datetime.datetime.strptime(date_string, "%Y-%m-%d %H:%M:%S")
+        sender, subject, date = parse_message_header(soup)
         if datetime.datetime.now() - date > datetime.timedelta(days=self._pylibrus_config.max_age_of_sending_msg_days):
             logger.info(f"Do not send '{subject}' (message too old, {date})")
             return None
-        contents = soup.find_all(attrs={"class": "container-message-content"})[0]
+        contents_html, contents_text = parse_message_body(soup)
 
         attachments = self.fetch_attachments(msg_path, soup, fetch_attchement_content)
-        return sender, subject, date, str(contents), contents.text, attachments
+        return sender, subject, date, contents_html, contents_text, attachments
 
     def msgs_from_folder(self, folder_id):
         self._last_folder_msg_path = self.msg_folder_path(folder_id)
         ret = self._get(self._last_folder_msg_path, referer=self.synergia_url_from_path("/rodzic/index"))
-        inbox_html = ret.text
-        soup = BeautifulSoup(inbox_html, "html.parser")
-        lines0 = soup.find_all("tr", {"class": "line0"})
-        lines1 = soup.find_all("tr", {"class": "line1"})
-        msgs = []
-        for msg in chain(lines0, lines1):
-            all_a_elems = msg.find_all("a")
-            if not all_a_elems:
-                continue
-            link = all_a_elems[0]["href"].strip()
-            read = True
-            for td in msg.find_all("td"):
-                if "bold" in td.get("style", ""):
-                    read = False
-                    break
-            msgs.append((link, read))
-        msgs.reverse()
-        return msgs
+        return parse_inbox(ret.text)
 
-    def fetch_announcements(self) -> list[tuple[str, str, datetime.datetime, str, str]]:
+    def fetch_announcements(self) -> list[ParsedAnnouncement]:
         """Scrapes /ogloszenia and returns (title, author, date, contents_html, contents_text) tuples.
 
         Announcements have no pagination, no per-item URL and no read/unread flag - the
         whole page lists every currently valid announcement on every call, newest first
         as Librus renders it. The caller is responsible for deduplication (there is no
         stable id to key on - see `announcement_id()`). See ANNOUNCEMENTS_PLAN.md for the
-        full rationale, including why unknown/missing fields are logged and skipped
-        rather than raising: a cosmetic Librus markup change here must not break message
-        forwarding, which is the primary feature.
+        full rationale; the parsing itself is `parse_announcements()`.
         """
         resp = self._get(
             self._pylibrus_config.announcements_path,
@@ -389,45 +333,4 @@ class LibrusScraper:
         )
         if "Brak dostępu" in resp.text:
             raise RuntimeError("Brak dostępu when fetching announcements - cookies likely invalid")
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        announcements = []
-        for table in soup.find_all("table", class_="decorated"):
-            thead = table.find("thead")
-            if thead is None:
-                continue
-            title = thead.get_text().strip()
-
-            fields = {}
-            for row in table.find_all("tr"):
-                th = row.find("th")
-                td = row.find("td")
-                if th is None or td is None:
-                    continue
-                fields[th.get_text().strip()] = td
-
-            date_td = fields.get("Data publikacji")
-            if not title or date_td is None:
-                logger.warning(f"Skipping announcement with missing title/date: title={title!r}")
-                continue
-
-            date_text = date_td.get_text().strip()
-            try:
-                date = datetime.datetime.strptime(date_text, "%Y-%m-%d")
-            except ValueError:
-                logger.warning(f"Skipping announcement '{title}' with unparseable date: {date_text!r}")
-                continue
-
-            unknown_labels = set(fields) - {"Dodał", "Data publikacji", "Treść"}
-            if unknown_labels:
-                logger.debug(f"Announcement '{title}' has unrecognized fields: {unknown_labels}")
-
-            author_td = fields.get("Dodał")
-            content_td = fields.get("Treść")
-            author = author_td.get_text().strip() if author_td is not None else ""
-            contents_html = str(content_td) if content_td is not None else ""
-            contents_text = content_td.get_text().strip() if content_td is not None else ""
-
-            announcements.append((title, author, date, contents_html, contents_text))
-
-        return announcements
+        return parse_announcements(resp.text)
