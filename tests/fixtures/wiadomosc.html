@@ -1,0 +1,38 @@
+<!-- Synthetic message page, shaped after what LibrusScraper.fetch_msg reads: each header label
+     sits in a <b> inside the first <td> of its row, the value in the row's second <td>; the body
+     is .container-message-content; attachments follow a "Pliki:" row. -->
+<html>
+<body>
+<div id="body">
+<table class="stretch container-message">
+<tr><td class="medium left"><b>Nadawca</b></td><td class="left">  Jan Kowalski (Nauczyciel)  </td></tr>
+<tr><td class="medium left"><b>Temat</b></td><td class="left">Wycieczka do muzeum</td></tr>
+<tr><td class="medium left"><b>Wysłano</b></td><td class="left">2025-09-08 14:30:00</td></tr>
+</table>
+<div class="container-message-content">Szanowni Państwo,<br/>zapraszamy na wycieczkę.</div>
+<table class="stretch">
+<tr><td><b>Pliki:</b></td><td></td></tr>
+<tr>
+<td>
+<!-- icon -->
+<img src="/assets/img/filetype_icons/pdf.png"/>
+<!-- name -->
+                        zgoda.pdf                    </td>
+<td>
+<a href="javascript:void(0);">
+<img class="" onclick='
+
+                        otworz_w_nowym_oknie(
+                            "\/wiadomosci\/pobierz_zalacznik\/1002\/77",
+                            "o2",
+                            420,
+                            250                        )
+
+                                    ' src="/assets/img/homework_files_icons/download.png" title=""/>
+</a>
+</td>
+</tr>
+</table>
+</div>
+</body>
+</html>
