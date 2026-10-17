@@ -1,5 +1,4 @@
 import argparse
-import base64
 import configparser
 import contextlib
 import dataclasses
@@ -9,11 +8,7 @@ import logging
 import smtplib
 import sys
 import time
-from email.mime.application import MIMEApplication
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
-from textwrap import dedent
 
 if __name__ == "__main__" and not __package__:
     # Run by path (`uv run src/pylibrus/pylibrus.py`, as the Procfile does): Python puts this
@@ -32,6 +27,9 @@ from pylibrus.db.schema import LibrusAnnouncement as LibrusAnnouncement
 from pylibrus.db.schema import Msg as Msg
 from pylibrus.db.store import MessageStore as MessageStore
 from pylibrus.logging_setup import configure_logging as configure_logging
+from pylibrus.notify.render import build_email_message as build_email_message
+from pylibrus.notify.render import build_webhook_payload as build_webhook_payload
+from pylibrus.notify.render import format_sender as format_sender
 from pylibrus.scraper.attachments import FAILED_TO_DOWNLOAD_ATTACHMENT_DATA as FAILED_TO_DOWNLOAD_ATTACHMENT_DATA
 from pylibrus.scraper.client import LibrusScraper as LibrusScraper
 from pylibrus.scraper.client import open_scraper as open_scraper
@@ -169,21 +167,7 @@ class LibrusNotifier:
         attachment_links = self._build_webhook_attachment_links(msg_from_db)
         name = display_name or self._librus_user.name
 
-        msg = (
-            dedent(f"""
-        *LIBRUS {name} - {msg_from_db.date}*
-        *Od: {msg_from_db.sender}*
-        *{msg_from_db.webhook_item_label}: {msg_from_db.subject}*
-        """)
-            + f"\n{msg_from_db.contents_text}"
-        )
-        if attachment_links:
-            msg += "\n\nZałączniki:\n"
-            for attachment_name, link in attachment_links:
-                msg += f"- <{link}|{attachment_name}>\n"
-        message = {
-            "text": msg,
-        }
+        message = build_webhook_payload(msg_from_db, name, attachment_links)
 
         response = requests.post(
             self._librus_user.notify.webhook,
@@ -194,72 +178,14 @@ class LibrusNotifier:
         if response.status_code != 200:
             logger.warning(f"Failed to send message. Status code: {response.status_code}")
 
-    @staticmethod
-    def format_sender(sender_info, sender_email):
-        sender_b64 = base64.b64encode(f"{sender_info} @ Librus".encode())
-        sender_info_encoded = "=?utf-8?B?" + sender_b64.decode() + "?="
-        return f'"{sender_info_encoded}" <{sender_email}>'
-
     def send_email(self, msg_from_db, display_name: str | None = None):
-        msg = MIMEMultipart("alternative")
-        msg.set_charset("utf-8")
-
         name = display_name or self._librus_user.name
-        msg["Subject"] = f"[LIBRUS {name}] {msg_from_db.subject_prefix}{msg_from_db.subject}"
-        msg["From"] = self.format_sender(msg_from_db.sender, self._librus_user.notify.smtp_user)
-        msg["To"] = ", ".join(self._librus_user.notify.email_dest)
-
-        attachments_only_with_link: list[Attachment] = []
-        attachments_with_data: list[Attachment] = []
-        for attach in self._store.attachments_for(msg_from_db.url):  # none when testing: the store isn't open
-            if attach.data is None:
-                attachments_only_with_link.append(attach)
-            else:
-                attachments_with_data.append(attach)
-        attachments_as_text_msg = (
-            ""
-            if not attachments_only_with_link
-            else "\n\nZałączniki:\n"
-            + "\n - ".join(
-                attachment_download_link(att.link_id) for att in attachments_only_with_link
-            )
+        msg = build_email_message(
+            msg_from_db,
+            name,
+            self._librus_user.notify,
+            self._store.attachments_for(msg_from_db.url),  # none when testing: the store isn't open
         )
-        attachments_as_html_msg = (
-            ""
-            if not attachments_only_with_link
-            else "<br/><br/><p>Załączniki:<p><ul>"
-            + "".join(
-                f"<li><a href='{attachment_download_link(att.link_id)}'>{att.name}</a></li>"
-                for att in attachments_only_with_link
-            )
-            + "</ul>"
-        )
-
-        header_as_text_msg = f"""
-
--------------------
-
-!! {msg_from_db.banner_text} !!!
-Data wysłania: {msg_from_db.date}
-
--------------------
-
-"""
-
-        header_as_html_msg = f"""<br/><h3>!!! {msg_from_db.banner_html}!!!</h3>
-<br><br>
-<b> Data wysłania:</b> {msg_from_db.date} <br>
-<hr>
-<br><br>"""
-
-        html_part = MIMEText(msg_from_db.contents_html + header_as_html_msg + attachments_as_html_msg, "html")
-        text_part = MIMEText(msg_from_db.contents_text + header_as_text_msg + attachments_as_text_msg, "plain")
-        msg.attach(html_part)
-        msg.attach(text_part)
-        for attach in attachments_with_data:
-            part = MIMEApplication(attach.data, Name=attach.name)
-            part["Content-Disposition"] = f'attachment; filename="{attach.name}"'
-            msg.attach(part)
 
         server = smtplib.SMTP(self._librus_user.notify.smtp_server, self._librus_user.notify.smtp_port)
         server.ehlo()
