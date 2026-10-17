@@ -1,11 +1,15 @@
+import contextlib
 import dataclasses
 import datetime
 import logging
+import time
+from collections.abc import Callable, Iterator
 
 from pylibrus.db.schema import LibrusAnnouncement, Msg
 from pylibrus.notify.notifier import LibrusNotifier
 from pylibrus.scraper.client import LibrusScraper
-from pylibrus.settings import LibrusUser, PyLibrusConfig
+from pylibrus.scraper.client import open_scraper as open_librus_scraper
+from pylibrus.settings import LibrusUser, Notify, PyLibrusConfig
 from pylibrus.storage.s3 import is_s3_webhook_source
 from pylibrus.utils import announcement_id
 
@@ -34,6 +38,52 @@ class UserCollection:
     items: list[CollectedItem] = dataclasses.field(default_factory=list)
 
 
+@contextlib.contextmanager
+def collect_all(
+    pylibrus_config: PyLibrusConfig,
+    librus_users: list[LibrusUser],
+    open_notifier: Callable[[PyLibrusConfig, LibrusUser], LibrusNotifier] = LibrusNotifier,
+    open_scraper: Callable[[PyLibrusConfig, LibrusUser], LibrusScraper] = open_librus_scraper,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Iterator[list["UserCollection"]]:
+    """The collect phase: every user in config order, notifying nothing. Yields their collections.
+
+    A context manager because each user's notifier has to outlive this phase - its session owns
+    the collected rows - so the notifiers close only when the `with` block, and with it the notify
+    phase, is done. A user whose collect raises (changed password, throttling) is logged and
+    skipped, so the other children are still notified - see MULTI_RECIPIENT_PLAN.md.
+
+    `open_notifier`, `open_scraper` and `sleep` are injectable so tests run this real loop with
+    fakes and without the pause between users.
+    """
+    with contextlib.ExitStack() as stack:
+        collections = []
+        for i, librus_user in enumerate(librus_users):
+            try:
+                notifier = stack.enter_context(open_notifier(pylibrus_config, librus_user))
+                with open_scraper(pylibrus_config, librus_user) as scraper:
+                    collections.append(collect_user(pylibrus_config, librus_user, scraper, notifier))
+            except Exception:
+                # One broken account (changed password, throttling) must not stop the other
+                # children being notified - see MULTI_RECIPIENT_PLAN.md.
+                logger.exception(f"Failed to collect messages for {librus_user.name}")
+            if i != len(librus_users) - 1:
+                sleep(pylibrus_config.sleep_between_librus_users)
+        yield collections
+
+
+def needs_attachment_content(pylibrus_config: PyLibrusConfig, notify: Notify) -> bool:
+    """Whether attachment bytes have to be downloaded at all for this destination.
+
+    The single place deciding it - keep it in sync when adding an attachment delivery mode. Email
+    embeds the bytes and an s3:// webhook re-uploads them; a librus_link webhook only links back
+    to Librus, so it never downloads.
+    """
+    return pylibrus_config.fetch_attachments and (
+        notify.is_email() or (notify.is_webhook() and is_s3_webhook_source(notify.webhook_attachments_source))
+    )
+
+
 def collect_user(
     pylibrus_config: PyLibrusConfig, librus_user: LibrusUser, scraper: LibrusScraper, notifier: "LibrusNotifier",
 ) -> UserCollection:
@@ -56,13 +106,7 @@ def collect_user(
         if not msg:
             logger.debug(f"Fetch {msg_path}")
 
-            fetch_attachment_content = pylibrus_config.fetch_attachments and (
-                librus_user.notify.is_email()
-                or (
-                    librus_user.notify.is_webhook()
-                    and is_s3_webhook_source(librus_user.notify.webhook_attachments_source)
-                )
-            )
+            fetch_attachment_content = needs_attachment_content(pylibrus_config, librus_user.notify)
             msg_content_or_none = scraper.fetch_msg(msg_path, fetch_attachment_content)
             if msg_content_or_none is None:
                 continue

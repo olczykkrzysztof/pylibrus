@@ -24,7 +24,7 @@ from pylibrus.pylibrus import (
     LibrusNotifier,
     LibrusUser,
     WebhookNotify,
-    collect_user,
+    collect_all,
     notify_collected,
     read_pylibrus_config,
 )
@@ -90,13 +90,20 @@ def make_user(name, notify, db_name="shared.sqlite", always_include_in_subject=T
     )
 
 
-def run(config, notifier_factory, users_and_scrapers, dry_run=False):
-    """One pylibrus run: collect every user, then notify, the way main() does."""
-    with contextlib.ExitStack() as stack:
-        collections = []
-        for user, scraper in users_and_scrapers:
-            notifier = stack.enter_context(notifier_factory(config, user))
-            collections.append(collect_user(config, user, scraper, notifier))
+def run(config, notifier_factory, users_and_scrapers, dry_run=False, allow_failed_users=False):
+    """One pylibrus run through the same collect_all() main() uses, then notify."""
+    scrapers = {id(user): scraper for user, scraper in users_and_scrapers}
+    with collect_all(
+        config,
+        [user for user, _ in users_and_scrapers],
+        open_notifier=notifier_factory,
+        open_scraper=lambda _config, user: contextlib.nullcontext(scrapers[id(user)]),
+        sleep=lambda _seconds: None,
+    ) as collections:
+        if not allow_failed_users:
+            # collect_all() logs and skips a user whose collect raises, as main() must. A test not
+            # expecting that would otherwise pass on a silently shorter run.
+            assert len(collections) == len(users_and_scrapers), "a user's collect failed - see the log"
         notify_collected(config, collections, dry_run=dry_run)
 
 
@@ -320,8 +327,8 @@ def test_items_are_sent_oldest_first_across_children(config, notifier_factory, s
     ]
 
 
-def test_a_child_whose_scrape_fails_does_not_block_the_others(config, notifier_factory, send_log):
-    """main() logs a failing user and carries on, so the rest are still collected and notified."""
+def test_a_child_whose_scrape_fails_does_not_block_the_others(config, notifier_factory, send_log, caplog):
+    """collect_all() logs a failing user and carries on, so the rest are still collected and notified."""
 
     class BrokenScraper:
         def msgs_from_folder(self, folder_id):
@@ -333,15 +340,10 @@ def test_a_child_whose_scrape_fails_does_not_block_the_others(config, notifier_f
         (make_user("Jas", dest), FakeScraper([("/wiadomosci/5/1101", False)])),
     ]
 
-    with contextlib.ExitStack() as stack:
-        collections = []
-        for user, scraper in users_and_scrapers:
-            notifier = stack.enter_context(notifier_factory(config, user))
-            with contextlib.suppress(Exception):  # mirrors main()'s per-user guard
-                collections.append(collect_user(config, user, scraper, notifier))
-        notify_collected(config, collections)
+    run(config, notifier_factory, users_and_scrapers, allow_failed_users=True)
 
     assert labels(send_log) == ["Jas"]
+    assert "Failed to collect messages for Ania" in caplog.text
 
 
 # --- always_include_in_subject: leaving a redundant child out of the label -----------------

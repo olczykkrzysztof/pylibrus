@@ -1,10 +1,8 @@
 import argparse
 import configparser
-import contextlib
 import datetime
 import logging
 import sys
-import time
 from pathlib import Path
 
 if __name__ == "__main__" and not __package__:
@@ -33,8 +31,10 @@ from pylibrus.notify.smtp import SmtpNotifier as SmtpNotifier
 from pylibrus.notify.webhook import WebhookNotifier as WebhookNotifier
 from pylibrus.pipeline.collect import CollectedItem as CollectedItem
 from pylibrus.pipeline.collect import UserCollection as UserCollection
+from pylibrus.pipeline.collect import collect_all as collect_all
 from pylibrus.pipeline.collect import collect_announcements as collect_announcements
 from pylibrus.pipeline.collect import collect_user as collect_user
+from pylibrus.pipeline.collect import needs_attachment_content as needs_attachment_content
 from pylibrus.pipeline.dispatch import notify_collected as notify_collected
 from pylibrus.pipeline.dispatch import notify_group as notify_group
 from pylibrus.pipeline.dispatch import warn_on_mixed_attachments_source as warn_on_mixed_attachments_source
@@ -191,22 +191,8 @@ def main():
         return send_test_notification(pylibrus_config, librus_users[0])
 
     # Collect every user before notifying anyone: a message sent to several children can only
-    # be labelled with all of them once all of them have been scraped. The notifiers stay open
-    # across both phases because their sessions own the collected rows.
-    with contextlib.ExitStack() as stack:
-        collections = []
-        for i, librus_user in enumerate(librus_users):
-            try:
-                notifier = stack.enter_context(LibrusNotifier(pylibrus_config, librus_user))
-                with open_scraper(pylibrus_config, librus_user) as scraper:
-                    collections.append(collect_user(pylibrus_config, librus_user, scraper, notifier))
-            except Exception:
-                # One broken account (changed password, throttling) must not stop the other
-                # children being notified - see MULTI_RECIPIENT_PLAN.md.
-                logger.exception(f"Failed to collect messages for {librus_user.name}")
-            if i != len(librus_users) - 1:
-                time.sleep(pylibrus_config.sleep_between_librus_users)
-
+    # be labelled with all of them once all of them have been scraped.
+    with collect_all(pylibrus_config, librus_users) as collections:
         notify_collected(pylibrus_config, collections, dry_run=args.dry)
 
 

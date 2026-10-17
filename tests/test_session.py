@@ -8,7 +8,7 @@ import types
 import pytest
 from fakes import FakeSession
 
-from pylibrus.pylibrus import LibrusScraper, LibrusSession, PyLibrusConfig
+from pylibrus.pylibrus import EmailNotify, LibrusScraper, LibrusSession, LibrusUser, PyLibrusConfig, open_scraper
 
 
 @pytest.fixture
@@ -66,3 +66,14 @@ def test_entering_the_scraper_logs_its_session_in(tmp_path):
         assert isinstance(scraper, LibrusScraper)
 
     assert session.logged_in
+
+
+def test_open_scraper_wraps_a_session_for_that_user(tmp_path):
+    notify = EmailNotify(smtp_user="u", smtp_pass="p", smtp_server="s", email_dest="d@example.com")
+    user = LibrusUser(login="ania-login", password="pw", name="Ania", notify=notify, db_name="x.sqlite")
+
+    scraper = open_scraper(PyLibrusConfig(workdir=str(tmp_path)), user)
+
+    assert isinstance(scraper, LibrusScraper)
+    assert isinstance(scraper._session, LibrusSession)
+    assert scraper._session._login == "ania-login"
